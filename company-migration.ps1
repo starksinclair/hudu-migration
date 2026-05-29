@@ -37,6 +37,10 @@ Import-Module HuduAPI -Force
 $SourceHuduUrl = $SourceHuduUrl ?? (Read-Host "Source Hudu URL (e.g. https://source.hudu.com)")
 $TargetHuduUrl = $TargetHuduUrl ?? (Read-Host "Target Hudu URL (e.g. https://target.hudu.com)")
 
+# Strip trailing slashes — the HuduAPI module adds its own
+$SourceHuduUrl = $SourceHuduUrl.TrimEnd('/')
+$TargetHuduUrl = $TargetHuduUrl.TrimEnd('/')
+
 # Accept SecureStrings or prompt securely
 if (-not $SourceHuduApiKeySecure) {
     $SourceHuduApiKeySecure = Read-Host "Source Hudu API Key" -AsSecureString
@@ -57,9 +61,21 @@ if ($SourceHuduApiKeySecure -isnot [System.Security.SecureString] -or
     if ($raw -match '^\d+$') { [int]$raw } else { 100 }
 }
 
-$TempPath = $TempPath ?? "C:\Temp\HuduMigration\downloads"
-$LogDir   = $LogDir   ?? "C:\Temp\HuduMigration\logs"
+# Cross-platform paths (works on macOS, Linux, and Windows)
+$MigrationRoot = Join-Path $HOME "HuduMigration"
+$TempPath = $TempPath ?? (Join-Path $MigrationRoot "downloads")
+$LogDir   = $LogDir   ?? (Join-Path $MigrationRoot "logs")
 $LogFile  = Join-Path $LogDir "migration_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# ============================================================================
+# DIRECTORY SETUP (must happen before Write-Log is called)
+# ============================================================================
+
+foreach ($dir in @($TempPath, $LogDir)) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+}
 
 # ============================================================================
 # HELPERS
@@ -69,24 +85,31 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts][$Level] $Message"
-    Add-Content -Path $LogFile -Value $line
+    # Guard against null $LogFile (e.g. if directory setup hasn't run yet)
+    if ($script:LogFile -and (Test-Path (Split-Path $script:LogFile -Parent))) {
+        Add-Content -Path $script:LogFile -Value $line
+    }
     $color = switch ($Level) {
-        "ERROR"   { "Red"     }
-        "WARN"    { "Yellow"  }
-        "SUCCESS" { "Green"   }
-        default   { "Cyan"    }
+        "ERROR"   { "Red" }
+        "WARN"    { "Yellow" }
+        "SUCCESS" { "Green" }
+        default    { "Cyan" }
     }
     Write-Host $line -ForegroundColor $color
 }
 
 function Save-Phase {
-    param([string]$Name, [object]$Data)
+    param(
+        [string]$Name,
+        [object]$Data
+    )
+
     $path = Join-Path $LogDir "$Name.json"
-    $Data | ConvertTo-Json -Depth 15 | Out-File $path -Encoding UTF8
+    $Data | ConvertTo-Json -Depth 20 | Set-Content -Path $path
     Write-Log "Phase '$Name' saved to $path"
 }
 
-function Load-Phase {
+function Read-Phase {
     param([string]$Name)
     $path = Join-Path $LogDir "$Name.json"
     if (Test-Path $path) {
@@ -102,9 +125,63 @@ function Get-PlainText {
     return [System.Net.NetworkCredential]::new('', $Secure).Password
 }
 
+function Get-FolderCompanyId {
+    param([object]$Folder)
+
+    if ($Folder.PSObject.Properties['company_id'] -and $Folder.company_id) {
+        return [int]$Folder.company_id
+    }
+
+    return $null
+}
+
+function Get-FolderParentFolderId {
+    param([object]$Folder)
+
+    foreach ($propertyName in @('parent_folder_id', 'parent_id')) {
+        if ($Folder.PSObject.Properties[$propertyName] -and $Folder.$propertyName) {
+            return [int]$Folder.$propertyName
+        }
+    }
+
+    return $null
+}
+
+function Get-FolderLookupKey {
+    param(
+        [string]$Name,
+        [object]$CompanyId,
+        [object]$ParentFolderId
+    )
+
+    $companyValue = if ($CompanyId) { [string]$CompanyId } else { '0' }
+    $parentValue  = if ($ParentFolderId) { [string]$ParentFolderId } else { '0' }
+    return ('{0}|{1}|{2}' -f $Name.Trim().ToLowerInvariant(), $companyValue, $parentValue)
+}
+
+function Add-FolderLookupEntry {
+    param(
+        [hashtable]$Lookup,
+        [object]$Folder
+    )
+
+    if (-not $Folder -or -not $Folder.name) {
+        return
+    }
+
+    $companyId = Get-FolderCompanyId $Folder
+    $parentId  = Get-FolderParentFolderId $Folder
+    $key       = Get-FolderLookupKey -Name $Folder.name -CompanyId $companyId -ParentFolderId $parentId
+    if (-not $Lookup.ContainsKey($key)) {
+        $Lookup[$key] = $Folder
+    }
+}
+
 # Swap HuduAPI context to SOURCE
 function Use-SourceHudu {
     $plain = Get-PlainText $SourceHuduApiKeySecure
+    Remove-HuduAPIKey -ErrorAction SilentlyContinue
+    Remove-HuduBaseURL -ErrorAction SilentlyContinue
     New-HuduAPIKey $plain
     New-HuduBaseUrl $SourceHuduUrl
     $plain = $null
@@ -113,31 +190,32 @@ function Use-SourceHudu {
 # Swap HuduAPI context to TARGET
 function Use-TargetHudu {
     $plain = Get-PlainText $TargetHuduApiKeySecure
+    Remove-HuduAPIKey -ErrorAction SilentlyContinue
+    Remove-HuduBaseURL -ErrorAction SilentlyContinue
     New-HuduAPIKey $plain
     New-HuduBaseUrl $TargetHuduUrl
     $plain = $null
 }
 
-# Upload file to Hudu (images vs. documents)
-function Upload-FileToHudu {
+# Upload file to Hudu
+function Send-FileToHudu {
     param(
         [string]$FilePath,
-        [int]   $ArticleId
+        [int]   $ArticleId,
+        [string]$Caption
     )
     if (-not (Test-Path $FilePath)) {
         Write-Log "File not found for upload: $FilePath" "ERROR"
         return $null
     }
-    $ext    = [IO.Path]::GetExtension($FilePath).ToLower()
-    $images = @('.jpg','.jpeg','.png','.gif','.webp','.bmp','.svg','.tiff','.tif')
     Use-TargetHudu
     try {
-        if ($ext -in $images) {
-            $result = New-HuduPublicPhoto -FilePath $FilePath -record_id $ArticleId -record_type 'Article'
-            return $result.public_photo ?? $result
-        } else {
-            $result = New-HuduUpload -FilePath $FilePath -record_id $ArticleId -record_type 'Article'
-            return $result.upload ?? $result
+        $result = New-HuduUpload -FilePath $FilePath -uploadable_id $ArticleId -uploadable_type Article
+        $upload = $result.upload ?? $result
+        return [PSCustomObject]@{
+            Kind = 'Upload'
+            Id   = $upload.id ?? $result.id
+            Raw  = $upload
         }
     } catch {
         Write-Log "Upload failed for $FilePath => article $ArticleId : $_" "ERROR"
@@ -151,7 +229,7 @@ function Upload-FileToHudu {
 
 function Show-CompanySelector {
     param([object[]]$Companies)
-    
+
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
@@ -164,7 +242,6 @@ function Show-CompanySelector {
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
 
-    # Title
     $titleLabel = New-Object System.Windows.Forms.Label
     $titleLabel.Text = "Select Migration Mode"
     $titleLabel.Location = New-Object System.Drawing.Point(20, 20)
@@ -172,7 +249,6 @@ function Show-CompanySelector {
     $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($titleLabel)
 
-    # Instructions
     $instructionLabel = New-Object System.Windows.Forms.Label
     $instructionLabel.Text = "Choose a single company to test, or migrate all companies at once."
     $instructionLabel.Location = New-Object System.Drawing.Point(20, 55)
@@ -180,7 +256,6 @@ function Show-CompanySelector {
     $instructionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
     $form.Controls.Add($instructionLabel)
 
-    # Company ListBox
     $companyLabel = New-Object System.Windows.Forms.Label
     $companyLabel.Text = "Companies in Source Instance:"
     $companyLabel.Location = New-Object System.Drawing.Point(20, 85)
@@ -193,26 +268,23 @@ function Show-CompanySelector {
     $listBox.Size = New-Object System.Drawing.Size(550, 250)
     $listBox.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $listBox.SelectionMode = "One"
-    
+
     foreach ($company in $Companies) {
         $displayText = "$($company.name) (ID: $($company.id))"
         $listBox.Items.Add($displayText) | Out-Null
     }
-    
+
     $form.Controls.Add($listBox)
 
-    # Info Label
     $infoLabel = New-Object System.Windows.Forms.Label
     $infoLabel.Text = "✓ Tip: Start with a small company for testing before running full migration"
     $infoLabel.Location = New-Object System.Drawing.Point(20, 365)
     $infoLabel.Size = New-Object System.Drawing.Size(550, 35)
     $infoLabel.AutoSize = $false
-    $infoLabel.WordWrap = $true
     $infoLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
     $infoLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 100, 0)
     $form.Controls.Add($infoLabel)
 
-    # Buttons
     $migrateOneButton = New-Object System.Windows.Forms.Button
     $migrateOneButton.Text = "Migrate This Company"
     $migrateOneButton.Location = New-Object System.Drawing.Point(20, 410)
@@ -267,12 +339,14 @@ function Show-CompanySelector {
     })
 
     $form.ShowDialog() | Out-Null
-    
+
     return @{
         Mode = $script:migrationMode
         CompanyId = $script:selectedCompanyId
     }
 }
+
+
 
 # ============================================================================
 # DIRECTORY SETUP
@@ -289,6 +363,10 @@ foreach ($dir in @($TempPath, $LogDir)) {
 # ============================================================================
 
 try {
+
+    # REQUIRED: configure the HuduAPI error log directory before any API calls
+    # Without this, every write operation (POST/PUT) throws "Cannot bind parameter Path"
+    Set-HapiErrorsDirectory -Path $LogDir | Out-Null
 
     Write-Log "=== Hudu-to-Hudu Migration Started ==="
     Write-Log "Source : $SourceHuduUrl"
@@ -396,17 +474,19 @@ try {
         }
         try {
             Use-TargetHudu
-            $created = New-HuduCompany -Name $co.name `
-                -Nickname     ($co.nickname       ?? '') `
-                -PhoneNumber  ($co.phone_number   ?? '') `
-                -Website      ($co.website        ?? '') `
-                -City         ($co.city           ?? '') `
-                -State        ($co.state          ?? '') `
-                -Zip          ($co.zip            ?? '') `
-                -CountryName  ($co.country_name   ?? '') `
-                -AddressLine1 ($co.address_line_1 ?? '') `
-                -Notes        ($co.notes          ?? '')
-            $newId = $created.id ?? $created.company.id
+            # Splat only non-null params — passing empty strings causes bind errors
+            $coParams = @{ Name = $co.name }
+            if ($co.nickname)       { $coParams['Nickname']     = $co.nickname       }
+            if ($co.phone_number)   { $coParams['PhoneNumber']  = $co.phone_number   }
+            if ($co.website)        { $coParams['Website']      = $co.website        }
+            if ($co.city)           { $coParams['City']         = $co.city           }
+            if ($co.state)          { $coParams['State']        = $co.state          }
+            if ($co.zip)            { $coParams['Zip']          = $co.zip            }
+            if ($co.country_name)   { $coParams['CountryName']  = $co.country_name   }
+            if ($co.address_line_1) { $coParams['AddressLine1'] = $co.address_line_1 }
+            if ($co.notes)          { $coParams['Notes']        = $co.notes          }
+            $created = New-HuduCompany @coParams
+            $newId   = $created.company.id ?? $created.id
             $CompanyMap[[string]$co.id] = $newId
             $Stats.CompaniesCreated++
             Write-Log "Created company '$($co.name)' => target ID $newId" "SUCCESS"
@@ -418,97 +498,153 @@ try {
 
     Write-Log "Companies - Created: $($Stats.CompaniesCreated) | Matched: $($Stats.CompaniesSkipped) | Failed: $($Stats.CompaniesFailed)"
 
-    # ==========================================================================
-    # STEP 2: MIGRATE FOLDERS
-    # ==========================================================================
+    # ============================================================================
+    # STEP 2: MIGRATE KNOWLEDGE BASE
+    # ============================================================================
 
-    Write-Log "========== STEP 2: MIGRATING FOLDERS =========="
+    # --------------------------------------------------------------------------
+    # STEP 2a: MIGRATE FOLDERS (hierarchy-aware, with company mapping)
+    # --------------------------------------------------------------------------
+
+    Write-Log "========== STEP 2a: MIGRATING FOLDERS =========="
 
     Use-SourceHudu
     $sourceFolders = Get-HuduFolders
     Write-Log "Found $($sourceFolders.Count) folders in source."
 
+    $sourceFolderById = @{}
+    foreach ($folder in $sourceFolders) {
+        $sourceFolderById[[string]$folder.id] = $folder
+    }
+
     Use-TargetHudu
     $targetFolders = Get-HuduFolders
+    $FolderLookup = @{}
 
+    foreach ($targetFolder in $targetFolders) {
+        Add-FolderLookupEntry -Lookup $FolderLookup -Folder $targetFolder
+    }
+
+    $pendingFolders = [System.Collections.Generic.List[object]]::new()
     foreach ($folder in $sourceFolders) {
-        # If SINGLE mode, skip folders not associated with selected company
-        if ($migrationMode -eq "SINGLE") {
-            if ($folder.company_id -and $folder.company_id -ne 0 -and $folder.company_id -ne $selectedCompanyId) {
+        $null = $pendingFolders.Add($folder)
+    }
+
+    while ($pendingFolders.Count -gt 0) {
+        $progressThisPass = 0
+
+        for ($index = $pendingFolders.Count - 1; $index -ge 0; $index--) {
+            $folder = $pendingFolders[$index]
+
+            # If SINGLE mode, skip folders not associated with selected company
+            if ($migrationMode -eq "SINGLE") {
+                if ($folder.company_id -and $folder.company_id -ne 0 -and $folder.company_id -ne $selectedCompanyId) {
+                    $pendingFolders.RemoveAt($index)
+                    continue
+                }
+            }
+
+            $targetCompanyId = $null
+            if ($folder.company_id -and $folder.company_id -ne 0) {
+                $targetCompanyId = $CompanyMap[[string]$folder.company_id]
+                if (-not $targetCompanyId) {
+                    Write-Log "No company mapping for folder '$($folder.name)'. Skipping." "WARN"
+                    $pendingFolders.RemoveAt($index)
+                    continue
+                }
+            }
+
+            $sourceParentId = Get-FolderParentFolderId $folder
+            $targetParentId = $null
+            if ($sourceParentId) {
+                if (-not $FolderMap.ContainsKey([string]$sourceParentId)) {
+                    $sourceParent = $sourceFolderById[[string]$sourceParentId]
+                    if ($sourceParent) {
+                        if ($migrationMode -eq "SINGLE" -and $sourceParent.company_id -and $sourceParent.company_id -ne 0 -and $sourceParent.company_id -ne $selectedCompanyId) {
+                            Write-Log "Skipping child folder '$($folder.name)' because its parent is outside SINGLE mode scope." "WARN"
+                            $pendingFolders.RemoveAt($index)
+                            continue
+                        }
+                        continue
+                    }
+                }
+
+                $targetParentId = $FolderMap[[string]$sourceParentId]
+                if (-not $targetParentId) {
+                    continue
+                }
+            }
+
+            $folderKey = Get-FolderLookupKey -Name $folder.name -CompanyId $targetCompanyId -ParentFolderId $targetParentId
+            $existing = $FolderLookup[$folderKey]
+
+            if ($existing) {
+                Write-Log "Folder '$($folder.name)' already exists in target. Mapping." "WARN"
+                $FolderMap[[string]$folder.id] = $existing.id
+                $pendingFolders.RemoveAt($index)
+                $progressThisPass++
                 continue
+            }
+
+            try {
+                Use-TargetHudu
+                $params = @{ Name = $folder.name }
+                if ($targetCompanyId)    { $params.CompanyId      = $targetCompanyId    }
+                if ($targetParentId)     { $params.ParentFolderId = $targetParentId     }
+                if ($folder.description) { $params.Description    = $folder.description }
+                $created = New-HuduFolder @params
+                $newId   = $created.id ?? $created.folder.id
+                $FolderMap[[string]$folder.id] = $newId
+
+                $createdFolder = [PSCustomObject]@{
+                    id               = $newId
+                    name             = $folder.name
+                    company_id       = $targetCompanyId
+                    parent_folder_id = $targetParentId
+                }
+                Add-FolderLookupEntry -Lookup $FolderLookup -Folder $createdFolder
+
+                $Stats.FoldersCreated++
+                Write-Log "Created folder '$($folder.name)' => target ID $newId" "SUCCESS"
+                $pendingFolders.RemoveAt($index)
+                $progressThisPass++
+            } catch {
+                Write-Log "Failed to create folder '$($folder.name)': $_" "ERROR"
+                $Stats.FoldersFailed++
+                $pendingFolders.RemoveAt($index)
             }
         }
 
-        $targetCompanyId = $null
-        if ($folder.company_id -and $folder.company_id -ne 0) {
-            $targetCompanyId = $CompanyMap[[string]$folder.company_id]
-            if (-not $targetCompanyId) {
-                Write-Log "No company mapping for folder '$($folder.name)'. Skipping." "WARN"
-                continue
+        if ($progressThisPass -eq 0) {
+            foreach ($folder in @($pendingFolders)) {
+                Write-Log "Unable to resolve parent mapping for folder '$($folder.name)'; skipping to avoid an incorrect hierarchy." "WARN"
             }
-        }
-
-        $existing = $targetFolders | Where-Object {
-            $_.name -eq $folder.name -and
-            (($targetCompanyId -and $_.company_id -eq $targetCompanyId) -or
-             (-not $targetCompanyId -and -not $_.company_id))
-        } | Select-Object -First 1
-
-        if ($existing) {
-            Write-Log "Folder '$($folder.name)' already exists in target. Mapping." "WARN"
-            $FolderMap[[string]$folder.id] = $existing.id
-            continue
-        }
-
-        try {
-            Use-TargetHudu
-            $params = @{ Name = $folder.name }
-            if ($targetCompanyId)    { $params.CompanyId   = $targetCompanyId    }
-            if ($folder.description) { $params.Description = $folder.description }
-            $created = New-HuduFolder @params
-            $newId   = $created.id ?? $created.folder.id
-            $FolderMap[[string]$folder.id] = $newId
-            $Stats.FoldersCreated++
-            Write-Log "Created folder '$($folder.name)' => target ID $newId" "SUCCESS"
-        } catch {
-            Write-Log "Failed to create folder '$($folder.name)': $_" "ERROR"
-            $Stats.FoldersFailed++
+            break
         }
     }
 
     Write-Log "Folders - Created: $($Stats.FoldersCreated) | Failed: $($Stats.FoldersFailed)"
 
-    # ==========================================================================
-    # STEP 3: MIGRATE ARTICLES (paginated, with attachments)
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # STEP 2b: MIGRATE ARTICLES (with company and folder mapping, plus attachments)
+    # --------------------------------------------------------------------------
 
-    Write-Log "========== STEP 3: MIGRATING ARTICLES =========="
+    Write-Log "========== STEP 2b: MIGRATING ARTICLES =========="
 
     Use-SourceHudu
-    $allSourceArticles = [System.Collections.ArrayList]@()
-    $page = 1; $pageSize = 50
-    Write-Log "Fetching all source articles (page size $pageSize)..."
-    do {
-        try {
-            $batch = Get-HuduArticles -PageSize $pageSize -Page $page
-            if ($batch -and $batch.Count -gt 0) {
-                $allSourceArticles.AddRange($batch) | Out-Null
-                Write-Log "  Page $page : $($batch.Count) articles (total: $($allSourceArticles.Count))"
-                $page++
-            } else { break }
-        } catch {
-            Write-Log "Error fetching articles page $page : $_" "ERROR"
-            break
+    Write-Log "Fetching source articles..."
+    # Get-HuduArticles fetches all at once; -PageSize/-Page params do not exist in this module version
+    try {
+        if ($migrationMode -eq "SINGLE") {
+            $articlesToMigrate = @(Get-HuduArticles -company_id $selectedCompanyId)
+            Write-Log "SINGLE MODE: Found $($articlesToMigrate.Count) articles for selected company"
+        } else {
+            $articlesToMigrate = @(Get-HuduArticles)
+            Write-Log "ALL MODE: Found $($articlesToMigrate.Count) total articles"
         }
-    } while ($true)
-    Write-Log "Total source articles: $($allSourceArticles.Count)"
-
-    # If SINGLE mode, filter to only articles in selected company
-    if ($migrationMode -eq "SINGLE") {
-        $articlesToMigrate = $allSourceArticles | Where-Object { $_.company_id -eq $selectedCompanyId }
-        Write-Log "SINGLE MODE: Filtering to $($articlesToMigrate.Count) articles in selected company"
-    } else {
-        $articlesToMigrate = $allSourceArticles
+    } catch {
+        Write-Log "Error fetching articles: $($_.Exception.Message)" "ERROR"
+        $articlesToMigrate = @()
     }
 
     $idx = 0
@@ -532,9 +668,10 @@ try {
 
         try {
             Use-TargetHudu
+            $articleHtml = $article.content ?? ''
             $params = @{
                 Name          = $article.name
-                Content       = $article.content ?? ''
+                Content       = $articleHtml
                 EnableSharing = [bool]($article.enable_sharing)
             }
             if ($targetCompanyId) { $params.CompanyId = $targetCompanyId }
@@ -556,28 +693,32 @@ try {
             Write-Log "Created article '$($article.name)' => target ID $newId" "SUCCESS"
 
             # -- Attachments --
-            $filesToProcess = @()
-            if ($article.public_photos -and $article.public_photos.Count -gt 0) {
-                $filesToProcess += $article.public_photos
+            $articleTempPath = Join-Path $TempPath "article_$($article.id)"
+            if (-not (Test-Path $articleTempPath)) {
+                New-Item -ItemType Directory -Path $articleTempPath -Force | Out-Null
             }
+
+            $downloadedAttachments = @()
+
             if ($article.uploads -and $article.uploads.Count -gt 0) {
-                $filesToProcess += $article.uploads | ForEach-Object { $_.url }
+                foreach ($upload in $article.uploads) {
+                    if (-not $upload.id) { continue }
+                    try {
+                        $downloadedAttachments += @(Get-HuduUploads -Id $upload.id -Download -OutDir $articleTempPath)
+                    } catch {
+                        Write-Log "  Upload download failed for article '$($article.name)' upload ID $($upload.id): $_" "ERROR"
+                    }
+                }
             }
 
-            foreach ($fileUrl in $filesToProcess) {
-                if (-not $fileUrl) { continue }
+            foreach ($attachment in $downloadedAttachments) {
+                $localPath = $attachment.localPath
+                if (-not $localPath -or -not (Test-Path $localPath)) { continue }
+
                 try {
-                    $rawName   = [IO.Path]::GetFileName($fileUrl.Split('?')[0])
-                    $safeName  = $rawName -replace '[^\w\.\-]', '_'
-                    $localPath = Join-Path $TempPath $safeName
-
-                    # Download
-                    $srcKey = Get-PlainText $SourceHuduApiKeySecure
-                    Invoke-WebRequest -Uri $fileUrl -OutFile $localPath `
-                        -Headers @{ "x-api-key" = $srcKey } -ErrorAction Stop
-                    $srcKey = $null
-
                     $fileSizeMB = (Get-Item $localPath).Length / 1MB
+                    $safeName = Split-Path $localPath -Leaf
+
                     if ($fileSizeMB -gt $MaxFileSizeMB) {
                         Write-Log "SKIPPED (too large $([math]::Round($fileSizeMB,1))MB > ${MaxFileSizeMB}MB): $safeName" "WARN"
                         $Stats.FilesSkipped++
@@ -585,15 +726,21 @@ try {
                         continue
                     }
 
-                    $uploaded = Upload-FileToHudu -FilePath $localPath -ArticleId $newId
+                    $attachmentCaption = $attachment.caption
+                    if (-not $attachmentCaption -and $attachment.name) { $attachmentCaption = $attachment.name }
+                    if (-not $attachmentCaption) { $attachmentCaption = [IO.Path]::GetFileNameWithoutExtension($localPath) }
+
+                    $uploaded = Send-FileToHudu -FilePath $localPath -Caption $attachmentCaption -ArticleId $newId
                     if ($uploaded) { $Stats.FilesUploaded++; Write-Log "  Uploaded '$safeName'" "SUCCESS" }
                     else           { $Stats.FilesFailed++ }
                     Remove-Item $localPath -Force -ErrorAction SilentlyContinue
                 } catch {
-                    Write-Log "  File transfer failed for '$fileUrl': $_" "ERROR"
+                    Write-Log "  File transfer failed for '$localPath': $_" "ERROR"
                     $Stats.FilesFailed++
                 }
             }
+
+            Remove-Item $articleTempPath -Recurse -Force -ErrorAction SilentlyContinue
         } catch {
             Write-Log "Failed to create article '$($article.name)': $_" "ERROR"
             $Stats.ArticlesFailed++
