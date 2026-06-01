@@ -41,9 +41,9 @@ cd path\to\hudu-migration
 On launch, the script will:
 
 1. Prompt for source and target Hudu URLs and API keys (stored as `SecureString`, never written to disk)
-2. Open a **company selector GUI** — choose one company for testing or migrate all companies
+2. **Company selector** — WinForms GUI on Windows; interactive console menu on macOS/Linux
 3. Run the migration phases with checkpoint JSON files for resume
-4. Write a timestamped log under your configured log directory (default: `C:\Temp\HuduMigration\logs`)
+4. Write a timestamped log under your configured log directory (default: `~/HuduMigration/logs` on Mac/Linux, `%USERPROFILE%\HuduMigration\logs` on Windows)
 
 ### Optional parameters
 
@@ -63,7 +63,7 @@ $LogDir   = "C:\Temp\HuduMigration\logs"
 
 ## Features
 
-- **Single-company testing mode** — GUI to migrate one company before full production run
+- **Single-company testing mode** — GUI (Windows) or console menu (macOS/Linux) to migrate one company before full production run
 - **Resume from checkpoints** — phase progress saved as JSON (`companies`, `folders`, `articles` mappings)
 - **Secure API key handling** — `SecureString` only; keys disposed in `finally` block
 - **File attachment migration** — downloads `public_photos` and `uploads`; skips files over size limit (default 100 MB)
