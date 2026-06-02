@@ -38,6 +38,7 @@ $_stepsDir = Join-Path $PSScriptRoot 'steps'
 . (Join-Path $_stepsDir 'Migrate-Companies.ps1')
 . (Join-Path $_stepsDir 'Migrate-Folders.ps1')
 . (Join-Path $_stepsDir 'Migrate-Articles.ps1')
+. (Join-Path $_stepsDir 'Migrate-Passwords.ps1')
 . (Join-Path $_stepsDir 'Migrate-Relink.ps1')
 . (Join-Path $_stepsDir 'Migrate-Procedures.ps1')
 . (Join-Path $_stepsDir 'Migrate-Websites.ps1')
@@ -147,6 +148,7 @@ try {
         FoldersCreated     = 0; FoldersFailed     = 0
         ArticlesCreated    = 0; ArticlesFailed    = 0
         FilesUploaded      = 0; FilesSkipped      = 0; FilesFailed       = 0
+        PasswordsCreated   = 0; PasswordsSkipped  = 0; PasswordsFailed   = 0
         ProceduresCreated  = 0; ProceduresSkipped = 0; ProceduresFailed  = 0
         TasksCreated       = 0; TasksFailed       = 0
         WebsitesCreated    = 0; WebsitesSkipped   = 0; WebsitesFailed    = 0
@@ -182,6 +184,12 @@ try {
         -SelectedCompanyId   $selectedCompanyId `
         -TempPath            $TempPath `
         -MaxFileSizeMB       $MaxFileSizeMB
+
+    Invoke-PasswordMigration `
+        -CompanyMap        $CompanyMap `
+        -Stats             $Stats `
+        -MigrationMode     $migrationMode `
+        -SelectedCompanyId $selectedCompanyId
 
     if ($SkippedFileManifest.Count -gt 0) {
         $manifestPath = Join-Path $LogDir "skipped_files.csv"
@@ -234,6 +242,7 @@ try {
     Write-Log "Companies  - Created: $($Stats.CompaniesCreated) | Matched: $($Stats.CompaniesSkipped) | Failed: $($Stats.CompaniesFailed)"
     Write-Log "Folders    - Created: $($Stats.FoldersCreated) | Failed: $($Stats.FoldersFailed)"
     Write-Log "Articles   - Created: $($Stats.ArticlesCreated) | Failed: $($Stats.ArticlesFailed)"
+    Write-Log "Passwords  - Created: $($Stats.PasswordsCreated) | Failed: $($Stats.PasswordsFailed)"
     Write-Log "Files      - Uploaded: $($Stats.FilesUploaded) | Skipped: $($Stats.FilesSkipped) | Failed: $($Stats.FilesFailed)"
     Write-Log "Relinking  - Updated: $($relinkResult.Updated) | Failed: $($relinkResult.Failed)"
     Write-Log "Procedures - Created: $($Stats.ProceduresCreated) | Skipped: $($Stats.ProceduresSkipped) | Failed: $($Stats.ProceduresFailed)"

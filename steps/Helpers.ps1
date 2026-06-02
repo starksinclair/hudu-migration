@@ -124,3 +124,93 @@ function Add-FolderLookupEntry {
         -ParentFolderId (Get-FolderParentFolderId $Folder)
     if (-not $Lookup.ContainsKey($key)) { $Lookup[$key] = $Folder }
 }
+
+# ---- Password migration helpers --------------------------------------------------
+
+function Get-PasswordFolderLookupKey {
+    param(
+        [string]$Name,
+        [object]$CompanyId
+    )
+
+    $companyValue = ($null -ne $CompanyId) ? [string]$CompanyId : '0'
+    return ('{0}|{1}' -f $Name.Trim().ToLowerInvariant(), $companyValue)
+}
+
+function Add-PasswordFolderLookupEntry {
+    param(
+        [hashtable]$Lookup,
+        [object]$Folder
+    )
+
+    if ($Folder -and $Folder.name) {
+        $companyId = ($Folder.PSObject.Properties['company_id'] -and $Folder.company_id) ? [int]$Folder.company_id : $null
+        $key = Get-PasswordFolderLookupKey -Name $Folder.name -CompanyId $companyId
+        if (-not $Lookup.ContainsKey($key)) { $Lookup[$key] = $Folder }
+    }
+}
+
+function Get-PasswordLookupKey {
+    param(
+        [string]$Name,
+        [object]$CompanyId,
+        [object]$PasswordFolderId,
+        [string]$Username,
+        [string]$Url
+    )
+
+    $companyValue = ($null -ne $CompanyId) ? [string]$CompanyId : '0'
+    $folderValue  = ($null -ne $PasswordFolderId) ? [string]$PasswordFolderId : '0'
+    $userValue    = if ($Username) { $Username.Trim().ToLowerInvariant() } else { '0' }
+    $urlValue     = if ($Url) { $Url.Trim().ToLowerInvariant() } else { '0' }
+    return ('{0}|{1}|{2}|{3}|{4}' -f $Name.Trim().ToLowerInvariant(), $companyValue, $folderValue, $userValue, $urlValue)
+}
+
+function Add-PasswordLookupEntry {
+    param(
+        [hashtable]$Lookup,
+        [object]$Password
+    )
+
+    if ($Password -and $Password.name) {
+        $companyId = ($Password.PSObject.Properties['company_id'] -and $Password.company_id) ? [int]$Password.company_id : $null
+        $folderId  = ($Password.PSObject.Properties['password_folder_id'] -and $Password.password_folder_id) ? [int]$Password.password_folder_id : $null
+        $username  = ($Password.PSObject.Properties['username'] -and $Password.username) ? [string]$Password.username : $null
+        $url       = ($Password.PSObject.Properties['url'] -and $Password.url) ? [string]$Password.url : $null
+        $key = Get-PasswordLookupKey -Name $Password.name -CompanyId $companyId -PasswordFolderId $folderId -Username $username -Url $url
+        if (-not $Lookup.ContainsKey($key)) { $Lookup[$key] = $Password }
+    }
+}
+
+function Get-FileSignature {
+    param([string]$FilePath)
+
+    if (-not (Test-Path $FilePath)) {
+        return $null
+    }
+
+    $item = Get-Item $FilePath
+    $hash = Get-FileHash -Algorithm SHA256 -Path $FilePath
+    return '{0}|{1}' -f $item.Length, $hash.Hash
+}
+
+function Test-AndRegister-FileSignature {
+    param(
+        [hashtable]$Registry,
+        [string]$FilePath,
+        [string]$Context
+    )
+
+    $signature = Get-FileSignature -FilePath $FilePath
+    if (-not $signature) {
+        return $false
+    }
+
+    if ($Registry.ContainsKey($signature)) {
+        Write-Log "SKIPPED duplicate file ($Context): $(Split-Path $FilePath -Leaf) matches '$($Registry[$signature])'" "WARN"
+        return $true
+    }
+
+    $Registry[$signature] = $FilePath
+    return $false
+}
