@@ -186,7 +186,6 @@ function Invoke-PasswordMigration {
                 Add-PasswordLookupEntry -Lookup $PasswordLookup -Password $createdObj
             }
 
-            Write-Log "Migrated password '$($password.name)' into target Folder ID: $($targetPasswordFolderId ?? 'Root')" "SUCCESS"
             $Stats.PasswordsCreated++
         } catch {
             Write-Log "Failed to migrate password record '$($password.name)': $_" "ERROR"
