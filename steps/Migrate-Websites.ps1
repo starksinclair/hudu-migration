@@ -1,11 +1,25 @@
 # ============================================================================
-# Migrate-Websites.ps1
+# Migrate-Websites.ps1 — company websites (Hudu-to-Hudu)
+#
+# ITGlue-Hudu-Migration maps IT Glue domains → Hudu websites (name = https://domain).
+# This step copies existing Hudu websites between tenants (name/URL as stored in source).
+# confluence.ps1 does not migrate websites (Confluence → Hudu articles only).
 # ============================================================================
+
+function Get-HuduWebsiteDisplayName {
+    param([object]$Site)
+    foreach ($key in @('name', 'url', 'website_url')) {
+        if ($Site.PSObject.Properties[$key] -and -not [string]::IsNullOrWhiteSpace([string]$Site.$key)) {
+            return [string]$Site.$key.Trim()
+        }
+    }
+    return $null
+}
 
 function Invoke-WebsiteMigration {
     param(
         [hashtable]$CompanyMap,
-        [hashtable]$Stats,
+        [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
         [int]      $SelectedCompanyId
     )
@@ -13,51 +27,80 @@ function Invoke-WebsiteMigration {
     Write-Log "========== STEP 6: MIGRATING WEBSITES =========="
 
     Use-SourceHudu
-    $sourceWebsites = @(Get-HuduWebsites)
+    $sourceWebsites = @(Get-HuduObjectList -Response (Get-HuduWebsites) -CollectionNames @('websites'))
     Write-Log "Found $($sourceWebsites.Count) websites in source."
 
     Use-TargetHudu
-    $targetWebsites = @(Get-HuduWebsites)
+    $targetWebsites = @(Get-HuduObjectList -Response (Get-HuduWebsites) -CollectionNames @('websites'))
 
     foreach ($site in $sourceWebsites) {
-        if ($MigrationMode -eq "SINGLE" -and $site.company_id -and $site.company_id -ne $SelectedCompanyId) { continue }
+        if ($MigrationMode -eq "SINGLE" -and $site.company_id -and $site.company_id -ne $SelectedCompanyId) {
+            continue
+        }
 
-        $targetCompanyId = $null
-        if ($site.company_id -and $site.company_id -ne 0) {
-            $targetCompanyId = $CompanyMap[[string]$site.company_id]
-            if (-not $targetCompanyId) {
-                Write-Log "No company mapping for website '$($site.name)'. Skipping." "WARN"
-                $Stats.WebsitesSkipped++
-                continue
-            }
+        $siteName = Get-HuduWebsiteDisplayName -Site $site
+        if (-not $siteName) {
+            $idLabel = if ($site.id) { $site.id } else { 'unknown' }
+            Write-Log "Website (ID $idLabel) has no name or URL — skipping." "WARN"
+            $Stats.WebsitesSkipped++
+            continue
+        }
+
+        if (-not $site.company_id -or $site.company_id -eq 0) {
+            Write-Log "Website '$siteName' has no company_id — skipping." "WARN"
+            $Stats.WebsitesSkipped++
+            continue
+        }
+
+        $targetCompanyId = $CompanyMap[[string]$site.company_id]
+        if (-not $targetCompanyId) {
+            Write-Log "No company mapping for website '$siteName'. Skipping." "WARN"
+            $Stats.WebsitesSkipped++
+            continue
         }
 
         $existing = $targetWebsites | Where-Object {
-            $_.name -eq $site.name -and $_.company_id -eq $targetCompanyId
+            $_.name -eq $siteName -and [string]$_.company_id -eq [string]$targetCompanyId
         } | Select-Object -First 1
 
         if ($existing) {
-            Write-Log "Website '$($site.name)' already exists in target. Skipping." "WARN"
+            Write-Log "Website '$siteName' already exists in target. Skipping." "WARN"
             $Stats.WebsitesSkipped++
             continue
         }
 
         try {
             Use-TargetHudu
-            $params = @{ name = $site.name }
-            if ($targetCompanyId)              { $params['companyid']    = $targetCompanyId             }
-            if ($site.notes)                   { $params['notes']        = $site.notes                  }
-            if ($null -ne $site.paused)        { $params['paused']       = $site.paused                 }
-            if ($null -ne $site.disable_dns)   { $params['DisableDNS']   = [string]$site.disable_dns   }
-            if ($null -ne $site.disable_ssl)   { $params['DisableSSL']   = [string]$site.disable_ssl   }
-            if ($null -ne $site.disable_whois) { $params['DisableWhois'] = [string]$site.disable_whois }
+            $params = @{
+                Name      = $siteName
+                CompanyId = [int]$targetCompanyId
+            }
+            if ($site.notes) { $params['Notes'] = $site.notes }
+
+            foreach ($pair in @(
+                @{ Param = 'Paused';       Source = 'paused' }
+                @{ Param = 'DisableDNS';   Source = 'disable_dns' }
+                @{ Param = 'DisableSSL';   Source = 'disable_ssl' }
+                @{ Param = 'DisableWhois'; Source = 'disable_whois' }
+                @{ Param = 'EnableDMARC';  Source = 'enable_dmarc_tracking' }
+                @{ Param = 'EnableDKIM';   Source = 'enable_dkim_tracking' }
+                @{ Param = 'EnableSPF';    Source = 'enable_spf_tracking' }
+            )) {
+                if ($site.PSObject.Properties[$pair.Source] -and $null -ne $site.($pair.Source)) {
+                    $flag = ConvertTo-HuduApiStringFlag -Value $site.($pair.Source)
+                    if ($null -ne $flag) { $params[$pair.Param] = $flag }
+                }
+            }
+            if ($site.PSObject.Properties['slug'] -and $site.slug) {
+                $params['Slug'] = $site.slug
+            }
 
             $created = New-HuduWebsite @params
             $newSite = $created.website ?? $created
             $Stats.WebsitesCreated++
-            Write-Log "Created website '$($site.name)' => target ID $($newSite.id)" "SUCCESS"
+            Write-Log "Created website '$siteName' => target ID $($newSite.id)" "SUCCESS"
         } catch {
-            Write-Log "Failed to create website '$($site.name)': $_" "ERROR"
+            Write-Log "Failed to create website '$siteName': $_" "ERROR"
             $Stats.WebsitesFailed++
         }
     }

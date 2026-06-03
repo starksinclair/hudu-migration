@@ -5,7 +5,7 @@
 function Invoke-ProcedureMigration {
     param(
         [hashtable]$CompanyMap,
-        [hashtable]$Stats,
+        [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
         [int]      $SelectedCompanyId
     )

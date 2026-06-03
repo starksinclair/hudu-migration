@@ -38,6 +38,13 @@ function Invoke-RelinkArticles {
             }
         }
 
+        # Apply upload URL remappings (e.g. inline image attachments using /file/*)
+        if ($entry.FileMap -and $entry.FileMap.Count -gt 0) {
+            foreach ($oldPath in $entry.FileMap.Keys) {
+                $html = $html -replace ([regex]::Escape($oldPath)), $entry.FileMap[$oldPath]
+            }
+        }
+
         # Swap any remaining source base-URL references (links, iframes, etc.)
         $html = $html -replace [regex]::Escape($script:SourceHuduUrl), $script:TargetHuduUrl
 

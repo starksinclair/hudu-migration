@@ -5,7 +5,7 @@
 function Invoke-FolderMigration {
     param(
         [hashtable]$CompanyMap,
-        [hashtable]$Stats,
+        [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
         [int]      $SelectedCompanyId
     )
@@ -39,6 +39,11 @@ function Invoke-FolderMigration {
                 $folder.company_id -and $folder.company_id -ne 0 -and
                 $folder.company_id -ne $SelectedCompanyId) {
                 $pending.RemoveAt($i); continue
+            }
+
+            if (Test-IsPhotoFolder $folder) {
+                $pending.RemoveAt($i)
+                continue
             }
 
             $targetCompanyId = $null

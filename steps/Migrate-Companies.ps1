@@ -5,7 +5,7 @@
 function Invoke-CompanyMigration {
     param(
         [object[]] $SourceCompanies,
-        [hashtable]$Stats,
+        [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
         [int]      $SelectedCompanyId
     )

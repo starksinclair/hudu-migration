@@ -3,6 +3,13 @@
 # ============================================================================
 
 function Invoke-PasswordMigration {
+    param(
+        [hashtable]$CompanyMap,
+        [System.Collections.IDictionary]$Stats,
+        [string]$MigrationMode,
+        [int]$SelectedCompanyId
+    )
+
     Write-Log "========== STEP 3: MIGRATING PASSWORDS AND PASSWORD FOLDERS =========="
 
     if (-not $Stats) {
@@ -79,8 +86,8 @@ function Invoke-PasswordMigration {
     $PasswordFolderMap = @{} 
 
     foreach ($folder in $sourcePasswordFoldersToMigrate) {
-        if ($migrationMode -eq "SINGLE") {
-            if ($folder.company_id -and $folder.company_id -ne 0 -and $folder.company_id -ne $selectedCompanyId) {
+        if ($MigrationMode -eq "SINGLE") {
+            if ($folder.company_id -and $folder.company_id -ne 0 -and $folder.company_id -ne $SelectedCompanyId) {
                 continue
             }
         }
@@ -133,8 +140,8 @@ function Invoke-PasswordMigration {
     }
 
     foreach ($password in $sourcePasswords) {
-        if ($migrationMode -eq "SINGLE") {
-            if ($password.company_id -and $password.company_id -ne 0 -and $password.company_id -ne $selectedCompanyId) {
+        if ($MigrationMode -eq "SINGLE") {
+            if ($password.company_id -and $password.company_id -ne 0 -and $password.company_id -ne $SelectedCompanyId) {
                 continue
             }
         }

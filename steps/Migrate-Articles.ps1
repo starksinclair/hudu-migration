@@ -6,7 +6,7 @@ function Invoke-ArticleMigration {
     param(
         [hashtable]  $CompanyMap,
         [hashtable]  $FolderMap,
-        [hashtable]  $Stats,
+        [System.Collections.IDictionary]$Stats,
         [System.Collections.Generic.List[PSCustomObject]]$SkippedFileManifest,
         [string]     $MigrationMode,
         [int]        $SelectedCompanyId,
@@ -78,6 +78,7 @@ function Invoke-ArticleMigration {
                 TargetUrl = $newUrl
                 Name      = $article.name
                 PhotoMap  = @{}   # /public_photo/{old_slug} -> /public_photo/{new_slug}
+                FileMap   = @{}   # /file/{old_slug} -> /file/{new_slug}
             }
             $articleMap[[string]$article.id] = $entry
             $Stats.ArticlesCreated++
@@ -88,86 +89,119 @@ function Invoke-ArticleMigration {
                 New-Item -ItemType Directory -Path $articleTempPath -Force | Out-Null
             }
 
-            # -- Public photos (embedded images) --
+            # Build a unified list of files to download + upload, matching the
+            # Confluence migration's "process attachments" loop structure.
+            # Each entry carries: Url, FileName, IsPublicPhoto, OldSlug
+            $filesToProcess = [System.Collections.Generic.List[PSCustomObject]]::new()
+
             if ($article.public_photos -and $article.public_photos.Count -gt 0) {
                 foreach ($photo in $article.public_photos) {
-                    $photoUrl  = if ($photo.url -match '^https?://') { $photo.url } else { "$($script:SourceHuduUrl)$($photo.url)" }
-                    $photoName = if ($photo.file_name) { [System.IO.Path]::GetFileName($photo.file_name) } else { "photo_$($photo.id).bin" }
-                    $photoPath = Join-Path $articleTempPath $photoName
-                    $oldSlug   = if ($photo.slug) { $photo.slug } else { $photo.id }
-
-                    try {
-                        Use-SourceHudu
-                        $plain   = Get-PlainText $script:SourceHuduApiKeySecure
-                        $headers = @{ 'x-api-key' = $plain }
-                        $plain   = $null
-                        Invoke-WebRequest -Uri $photoUrl -Headers $headers -OutFile $photoPath -ErrorAction Stop
-
-                        $uploaded = Upload-FileToHudu -FilePath $photoPath -ArticleId $newId
-                        if ($uploaded) {
-                            $newPhotoUrl      = $uploaded.url ?? $uploaded.file_url
-                            if ($newPhotoUrl) {
-                                $newPhotoRelative = ([uri]$newPhotoUrl).PathAndQuery
-                                $entry.PhotoMap["/public_photo/$oldSlug"] = $newPhotoRelative
-                                Write-Log "  Uploaded public photo '$photoName' => $newPhotoRelative" "SUCCESS"
-                            } else {
-                                Write-Log "  Uploaded '$photoName' but could not determine new URL — PhotoMap entry skipped." "WARN"
-                            }
-                            $Stats.FilesUploaded++
-                        } else {
-                            $Stats.FilesFailed++
-                        }
-                        Remove-Item $photoPath -Force -ErrorAction SilentlyContinue
-                    } catch {
-                        Write-Log "  Public photo download failed for '$photoName': $_" "WARN"
-                        $Stats.FilesFailed++
-                    }
+                    $photoUrl = $photo.url
+                    $filesToProcess.Add([PSCustomObject]@{
+                        Url           = if ($photoUrl -match '^https?://') { $photoUrl } else { "$($script:SourceHuduUrl)$photoUrl" }
+                        FileName      = if ($photo.file_name) { [IO.Path]::GetFileName($photo.file_name) } else { "photo_$($photo.id).bin" }
+                        IsPublicPhoto = $true
+                        OldSlug       = if ($photo.slug) { $photo.slug } else { $photo.id }
+                        PublicPhotoId = [string]($photo.id)
+                        PublicPhotoNumericId = if ($photo.numeric_id) { [int]$photo.numeric_id } else { 0 }
+                        OldPath       = if ($photoUrl) {
+                            if ($photoUrl -match '^https?://') { ([uri]$photoUrl).PathAndQuery } else { $photoUrl }
+                        } else { $null }
+                    })
                 }
             }
 
-            # -- Named uploads (non-image attachments) --
             if ($article.uploads -and $article.uploads.Count -gt 0) {
                 foreach ($upload in $article.uploads) {
                     if (-not $upload.id) { continue }
-                    Use-SourceHudu
-                    try {
-                        $downloaded = @(Get-HuduUploads -Id $upload.id -Download -OutDir $articleTempPath)
-                    } catch {
-                        Write-Log "  Upload download failed for article '$($article.name)' upload ID $($upload.id): $_" "ERROR"
-                        continue
+                    $uploadUrl = $upload.url ?? $upload.file_url
+                    if ([string]::IsNullOrWhiteSpace($uploadUrl)) { continue }
+                    $filesToProcess.Add([PSCustomObject]@{
+                        Url           = if ($uploadUrl -match '^https?://') { $uploadUrl } else { "$($script:SourceHuduUrl)$uploadUrl" }
+                        FileName      = if ($upload.file_name) { [IO.Path]::GetFileName($upload.file_name) } else { "upload_$($upload.id).bin" }
+                        IsPublicPhoto = $false
+                        OldSlug       = $null
+                        PublicPhotoId = $null
+                        PublicPhotoNumericId = 0
+                        OldPath       = if ($uploadUrl -match '^https?://') { ([uri]$uploadUrl).PathAndQuery } else { $uploadUrl }
+                    })
+                }
+            }
+
+            # Process each file: download from source, check size, upload to target
+            foreach ($fileEntry in $filesToProcess) {
+                $record = Invoke-HuduAttachDownload `
+                    -Url       $fileEntry.Url `
+                    -FileName  $fileEntry.FileName `
+                    -OutDir    $articleTempPath `
+                    -MaxSizeMB $MaxFileSizeMB `
+                    -PublicPhotoId $fileEntry.PublicPhotoId `
+                    -PublicPhotoNumericId $fileEntry.PublicPhotoNumericId
+
+                if (-not $record.SuccessDownload) {
+                    if ($record.FailureKind -eq 'MISSING_SOURCE_ASSET' -or $record.FailureKind -eq 'AUTH_OR_SCOPE') {
+                        Write-Log "  Skipping source file '$($fileEntry.FileName)' due to $($record.FailureKind): $($record.AttemptDiagnostics)" "WARN"
+                        $Stats.FilesSkipped++
+                        $SkippedFileManifest.Add([PSCustomObject]@{
+                            Article   = $article.name
+                            ArticleId = $article.id
+                            File      = $fileEntry.FileName
+                            SizeMB    = $null
+                            LimitMB   = $MaxFileSizeMB
+                            Reason    = $record.FailureKind
+                            SourceUrl = $fileEntry.Url
+                            Attempts  = $record.AttemptDiagnostics
+                        })
+                    } else {
+                        Write-Log "  Failed to download '$($fileEntry.FileName)' ($($fileEntry.Url))" "ERROR"
+                        $Stats.FilesFailed++
                     }
+                    continue
+                }
 
-                    foreach ($attachment in $downloaded) {
-                        $localPath = $attachment.localPath
-                        if (-not $localPath -or -not (Test-Path $localPath)) { continue }
-                        try {
-                            $fileSizeMB = (Get-Item $localPath).Length / 1MB
-                            $safeName   = Split-Path $localPath -Leaf
+                if ($record.AttachmentTooLarge) {
+                    Write-Log "SKIPPED (too large $([math]::Round($record.AttachmentSize / 1MB, 1))MB > ${MaxFileSizeMB}MB): $($record.FileName)" "WARN"
+                    $Stats.FilesSkipped++
+                    $SkippedFileManifest.Add([PSCustomObject]@{
+                        Article   = $article.name
+                        ArticleId = $article.id
+                        File      = $record.FileName
+                        SizeMB    = [math]::Round($record.AttachmentSize / 1MB, 1)
+                        LimitMB   = $MaxFileSizeMB
+                        Reason    = 'TOO_LARGE'
+                        SourceUrl = $fileEntry.Url
+                        Attempts  = $record.AttemptDiagnostics
+                    })
+                    Remove-Item $record.LocalPath -Force -ErrorAction SilentlyContinue
+                    continue
+                }
 
-                            if ($fileSizeMB -gt $MaxFileSizeMB) {
-                                Write-Log "SKIPPED (too large $([math]::Round($fileSizeMB,1))MB > ${MaxFileSizeMB}MB): $safeName" "WARN"
-                                $Stats.FilesSkipped++
-                                $SkippedFileManifest.Add([PSCustomObject]@{
-                                    Article   = $article.name
-                                    ArticleId = $article.id
-                                    File      = $safeName
-                                    SizeMB    = [math]::Round($fileSizeMB, 1)
-                                    LimitMB   = $MaxFileSizeMB
-                                })
-                                Remove-Item $localPath -Force -ErrorAction SilentlyContinue
-                                continue
-                            }
+                $uploaded = Upload-FileToHudu -FilePath $record.LocalPath -ArticleId $newId -AsPublicPhoto $fileEntry.IsPublicPhoto
+                if ($uploaded -and $uploaded.Url) {
+                    $Stats.FilesUploaded++
+                    Write-Log "  Uploaded '$($record.FileName)' => $($uploaded.Url)" "SUCCESS"
 
-                            $up = Upload-FileToHudu -FilePath $localPath -ArticleId $newId
-                            if ($up) { $Stats.FilesUploaded++; Write-Log "  Uploaded '$safeName'" "SUCCESS" }
-                            else     { $Stats.FilesFailed++ }
-                            Remove-Item $localPath -Force -ErrorAction SilentlyContinue
-                        } catch {
-                            Write-Log "  File transfer failed for '$localPath': $_" "ERROR"
-                            $Stats.FilesFailed++
+                    # For public photos, map old slug -> new relative path for Step 4 relinking
+                    if ($fileEntry.IsPublicPhoto -and $fileEntry.OldSlug) {
+                        $newPhotoRelative = ([uri]$uploaded.Url).PathAndQuery
+                        $entry.PhotoMap["/public_photo/$($fileEntry.OldSlug)"] = $newPhotoRelative
+                        if ($fileEntry.OldPath) {
+                            $entry.PhotoMap[$fileEntry.OldPath] = $newPhotoRelative
                         }
                     }
+
+                    # For uploads (including image attachments), map source /file URLs
+                    # to the new target /file URL so inline <img src="/file/..."> is fixed.
+                    if (-not $fileEntry.IsPublicPhoto -and $fileEntry.OldPath) {
+                        $newUploadRelative = ([uri]$uploaded.Url).PathAndQuery
+                        $entry.FileMap[$fileEntry.OldPath] = $newUploadRelative
+                    }
+                } else {
+                    $Stats.FilesFailed++
+                    Write-Log "  Upload failed for '$($record.FileName)'" "ERROR"
                 }
+
+                Remove-Item $record.LocalPath -Force -ErrorAction SilentlyContinue
             }
 
             Remove-Item $articleTempPath -Recurse -Force -ErrorAction SilentlyContinue

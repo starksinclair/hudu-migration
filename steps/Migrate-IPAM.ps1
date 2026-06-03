@@ -5,7 +5,7 @@
 function Invoke-IPAMMigration {
     param(
         [hashtable]$CompanyMap,
-        [hashtable]$Stats,
+        [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
         [int]      $SelectedCompanyId
     )
@@ -61,11 +61,20 @@ function Invoke-IPAMMigration {
             $Stats.NetworksCreated++
             Write-Log "Created network '$($net.name)' => target ID $newNetId" "SUCCESS"
 
-            # Migrate IP addresses within this network
+            # Migrate IP addresses within this network.
+            # HuduAPI module uses snake_case parameters matching the API;
+            # fall back to fetching all and filtering client-side if the
+            # parameter isn't recognised (older module versions).
             Use-SourceHudu
             $srcIPs = @()
-            try { $srcIPs = @(Get-HuduIPAddresses -NetworkId $net.id) } catch {
-                Write-Log "  Could not fetch IP addresses for network '$($net.name)': $_" "WARN"
+            try {
+                $srcIPs = @(Get-HuduIPAddresses -network_id $net.id)
+            } catch {
+                try {
+                    $srcIPs = @(Get-HuduIPAddresses) | Where-Object { $_.network_id -eq $net.id }
+                } catch {
+                    Write-Log "  Could not fetch IP addresses for network '$($net.name)': $_" "WARN"
+                }
             }
 
             foreach ($ip in $srcIPs) {

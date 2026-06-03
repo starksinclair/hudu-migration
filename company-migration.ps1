@@ -45,13 +45,14 @@ $_stepsDir = Join-Path $PSScriptRoot 'steps'
 . (Join-Path $_stepsDir 'Migrate-IPAM.ps1')
 . (Join-Path $_stepsDir 'Migrate-CompanyPhotos.ps1')
 . (Join-Path $_stepsDir 'Migrate-Racks.ps1')
+. (Join-Path $_stepsDir 'Migrate-Flags.ps1')
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-$SourceHuduUrl = $SourceHuduUrl ?? (Read-Host "Source Hudu URL (e.g. https://source.hudu.com)")
-$TargetHuduUrl = $TargetHuduUrl ?? (Read-Host "Target Hudu URL (e.g. https://target.hudu.com)")
+$SourceHuduUrl = 'https://docs.msp4.com' ?? (Read-Host "Source Hudu URL (e.g. https://source.hudu.com)")
+$TargetHuduUrl = 'https://naahia.huducloud.com' ?? (Read-Host "Target Hudu URL (e.g. https://target.hudu.com)")
 
 $SourceHuduUrl = $SourceHuduUrl.TrimEnd('/')
 $TargetHuduUrl = $TargetHuduUrl.TrimEnd('/')
@@ -142,7 +143,8 @@ try {
         Write-Log "=== FULL MIGRATION MODE: ALL COMPANIES ===" "SUCCESS"
     }
 
-    # Shared state
+    # Shared state — use [ordered] for stable summary order. Step functions must take
+    # [System.Collections.IDictionary], not [hashtable]; binding [ordered] to [hashtable] copies it.
     $Stats = [ordered]@{
         CompaniesCreated   = 0; CompaniesSkipped  = 0; CompaniesFailed   = 0
         FoldersCreated     = 0; FoldersFailed     = 0
@@ -154,8 +156,12 @@ try {
         WebsitesCreated    = 0; WebsitesSkipped   = 0; WebsitesFailed    = 0
         NetworksCreated    = 0; NetworksSkipped   = 0; NetworksFailed    = 0
         IPsCreated         = 0; IPsFailed         = 0
+        PhotoFoldersCreated = 0; PhotoFoldersSkipped = 0; PhotoFoldersFailed = 0
         PhotosUploaded     = 0; PhotosFailed      = 0
         RacksCreated       = 0; RacksSkipped      = 0; RacksFailed       = 0
+        RackItemsCreated   = 0; RackItemsSkipped  = 0; RackItemsFailed   = 0
+        FlagTypesCreated   = 0; FlagTypesSkipped  = 0; FlagTypesFailed   = 0
+        FlagsCreated       = 0; FlagsSkipped      = 0; FlagsDuplicatesSkipped = 0; FlagsFailed = 0
     }
     $SkippedFileManifest = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -223,10 +229,19 @@ try {
         -Stats             $Stats `
         -MigrationMode     $migrationMode `
         -SelectedCompanyId $selectedCompanyId `
-        -TempPath          $TempPath
+        -TempPath          $TempPath `
+        -MaxFileSizeMB     $MaxFileSizeMB
 
     $RackMap = Invoke-RackMigration `
         -CompanyMap        $CompanyMap `
+        -Stats             $Stats `
+        -MigrationMode     $migrationMode `
+        -SelectedCompanyId $selectedCompanyId
+
+    Invoke-FlagMigration `
+        -CompanyMap        $CompanyMap `
+        -ArticleMap       $ArticleMap `
+        -RackMap           $RackMap `
         -Stats             $Stats `
         -MigrationMode     $migrationMode `
         -SelectedCompanyId $selectedCompanyId
@@ -250,8 +265,12 @@ try {
     Write-Log "Websites   - Created: $($Stats.WebsitesCreated) | Skipped: $($Stats.WebsitesSkipped) | Failed: $($Stats.WebsitesFailed)"
     Write-Log "Networks   - Created: $($Stats.NetworksCreated) | Skipped: $($Stats.NetworksSkipped) | Failed: $($Stats.NetworksFailed)"
     Write-Log "IPs        - Created: $($Stats.IPsCreated) | Failed: $($Stats.IPsFailed)"
+    Write-Log "Photo flds - Created: $($Stats.PhotoFoldersCreated) | Skipped: $($Stats.PhotoFoldersSkipped) | Failed: $($Stats.PhotoFoldersFailed)"
     Write-Log "Photos     - Uploaded: $($Stats.PhotosUploaded) | Failed: $($Stats.PhotosFailed)"
     Write-Log "Racks      - Created: $($Stats.RacksCreated) | Skipped: $($Stats.RacksSkipped) | Failed: $($Stats.RacksFailed)"
+    Write-Log "Rack items - Created: $($Stats.RackItemsCreated) | Skipped: $($Stats.RackItemsSkipped) | Failed: $($Stats.RackItemsFailed)"
+    Write-Log "Flag types - Created: $($Stats.FlagTypesCreated) | Matched: $($Stats.FlagTypesSkipped) | Failed: $($Stats.FlagTypesFailed)"
+    Write-Log "Flags      - Created: $($Stats.FlagsCreated) | Skipped: $($Stats.FlagsSkipped) | Duplicates: $($Stats.FlagsDuplicatesSkipped) | Failed: $($Stats.FlagsFailed)"
     Write-Log "Log        : $LogFile"
     Write-Log "Data       : $LogDir"
 
