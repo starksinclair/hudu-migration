@@ -36,6 +36,25 @@ function Invoke-ArticleMigration {
         $articles = @()
     }
 
+    $articles = @(Get-HuduObjectList -Response $articles -CollectionNames @('articles'))
+    $deduped  = [System.Collections.Generic.List[object]]::new()
+    $seenIds  = @{}
+    foreach ($a in $articles) {
+        if (-not $a.id) { continue }
+        $idKey = [string]$a.id
+        if ($seenIds.ContainsKey($idKey)) { continue }
+        $seenIds[$idKey] = $true
+        $null = $deduped.Add($a)
+    }
+    $articles = @($deduped)
+    Write-Log "Migrating $($articles.Count) unique article(s) by id." "INFO"
+
+    Use-TargetHudu
+    $articleTargetLookup = @{}
+    foreach ($ta in @(Get-HuduObjectList -Response (Get-HuduArticles) -CollectionNames @('articles'))) {
+        Add-ArticleLookupEntry -Lookup $articleTargetLookup -Article $ta
+    }
+
     $idx   = 0
     $total = $articles.Count
 
@@ -57,10 +76,28 @@ function Invoke-ArticleMigration {
             $targetFolderId = $FolderMap[[string]$article.folder_id]
         }
 
+        $migratedName = Get-MigrationName -Name $article.name
+        $lookupKey    = Get-ArticleLookupKey -Name $article.name -CompanyId ($targetCompanyId ?? 0) -FolderId ($targetFolderId ?? 0)
+        if ($articleTargetLookup.ContainsKey($lookupKey)) {
+            $existingId = $articleTargetLookup[$lookupKey]
+            $articleMap[[string]$article.id] = [PSCustomObject]@{
+                SourceId      = $article.id
+                TargetId      = $existingId
+                TargetUrl     = $null
+                Name          = $article.name
+                MigratedName  = $migratedName
+                PhotoMap      = @{}
+                FileMap       = @{}
+            }
+            $Stats.ArticlesSkipped++
+            Write-Log "Article '$migratedName' already on target (ID $existingId). Mapped source $($article.id)." "WARN"
+            continue
+        }
+
         try {
             Use-TargetHudu
             $params = @{
-                Name          = $article.name
+                Name          = $migratedName
                 Content       = ($article.content ?? '')
                 EnableSharing = [bool]($article.enable_sharing)
             }
@@ -72,17 +109,25 @@ function Invoke-ArticleMigration {
             $newId      = $newArticle.id
             $newUrl     = $newArticle.url
 
+            Add-ArticleLookupEntry -Lookup $articleTargetLookup -Article ([PSCustomObject]@{
+                id         = $newId
+                name       = $migratedName
+                company_id = ($targetCompanyId ?? 0)
+                folder_id  = ($targetFolderId ?? 0)
+            })
+
             $entry = [PSCustomObject]@{
-                SourceId  = $article.id
-                TargetId  = $newId
-                TargetUrl = $newUrl
-                Name      = $article.name
-                PhotoMap  = @{}   # /public_photo/{old_slug} -> /public_photo/{new_slug}
-                FileMap   = @{}   # /file/{old_slug} -> /file/{new_slug}
+                SourceId     = $article.id
+                TargetId     = $newId
+                TargetUrl    = $newUrl
+                Name         = $article.name
+                MigratedName = $migratedName
+                PhotoMap     = @{}
+                FileMap      = @{}
             }
             $articleMap[[string]$article.id] = $entry
             $Stats.ArticlesCreated++
-            Write-Log "Created article '$($article.name)' => target ID $newId" "SUCCESS"
+            Write-Log "Created article '$migratedName' => target ID $newId (source $($article.id))" "SUCCESS"
 
             $articleTempPath = Join-Path $TempPath "article_$($article.id)"
             if (-not (Test-Path $articleTempPath)) {
@@ -212,7 +257,8 @@ function Invoke-ArticleMigration {
     }
 
     Write-Progress -Activity "Migrating Articles" -Completed
-    Write-Log "Articles - Created: $($Stats.ArticlesCreated) | Failed: $($Stats.ArticlesFailed)"
+    $skipped = if ($null -ne $Stats.ArticlesSkipped) { $Stats.ArticlesSkipped } else { 0 }
+    Write-Log "Articles - Created: $($Stats.ArticlesCreated) | Matched: $skipped | Failed: $($Stats.ArticlesFailed)"
     Write-Log "Files    - Uploaded: $($Stats.FilesUploaded) | Skipped: $($Stats.FilesSkipped) | Failed: $($Stats.FilesFailed)"
     return $articleMap
 }

@@ -84,7 +84,7 @@ function Invoke-FolderMigration {
 
             try {
                 Use-TargetHudu
-                $params = @{ Name = $folder.name }
+                $params = @{ Name = (Get-MigrationName -Name $folder.name) }
                 if ($targetCompanyId)    { $params['CompanyId']      = $targetCompanyId    }
                 if ($targetParentId)     { $params['ParentFolderId'] = $targetParentId     }
                 if ($folder.description) { $params['Description']    = $folder.description }
@@ -95,7 +95,7 @@ function Invoke-FolderMigration {
 
                 Add-FolderLookupEntry -Lookup $folderLookup -Folder ([PSCustomObject]@{
                     id               = $newId
-                    name             = $folder.name
+                    name             = $params.Name
                     company_id       = $targetCompanyId
                     parent_folder_id = $targetParentId
                 })

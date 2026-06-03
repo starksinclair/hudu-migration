@@ -30,7 +30,7 @@ function Initialize-FlagTypeMap {
 
         try {
             $color = if ($st.color) { [string]$st.color } else { 'grey' }
-            $created = New-HuduFlagType -Name $st.name -Color $color
+            $created = New-HuduFlagType -Name (Get-MigrationName -Name $st.name) -Color $color
             $newId = $created.id ?? $created.flag_type.id
             if ($newId) {
                 $map[[string]$st.id] = [int]$newId
@@ -125,16 +125,29 @@ function Warm-AssetMapsForFlags {
     }
 }
 
+function Build-ArticleTargetLookup {
+    Use-TargetHudu
+    $lookup = @{}
+    foreach ($ta in @(Get-HuduObjectList -Response (Get-HuduArticles) -CollectionNames @('articles'))) {
+        Add-ArticleLookupEntry -Lookup $lookup -Article $ta
+    }
+    return $lookup
+}
+
 function Resolve-MigrationFlagableId {
     param(
         [object]$Flag,
         [hashtable]$ArticleMap,
+        [hashtable]$ArticleTargetLookup,
+        [hashtable]$ArticleResolveCache,
         [hashtable]$CompanyMap,
+        [hashtable]$FolderMap,
         [hashtable]$AssetMapCache,
         [hashtable]$SourceAssetCompanyCache,
         [hashtable]$TargetPasswordBySourceId,
         [hashtable]$TargetWebsiteBySourceId,
         [hashtable]$RackMap,
+        [hashtable]$MigratedAssetMap = @{},
         [string]$MigrationMode,
         [int]$SelectedCompanyId
     )
@@ -144,11 +157,18 @@ function Resolve-MigrationFlagableId {
 
     switch -Regex ($type) {
         '^Article$' {
-            $entry = $ArticleMap[[string]$sourceId]
-            if ($entry) { return [int]$entry.TargetId }
-            return $null
+            return Resolve-MigrationArticleTargetId `
+                -SourceArticleId $sourceId `
+                -ArticleMap $ArticleMap `
+                -ArticleTargetLookup $ArticleTargetLookup `
+                -CompanyMap $CompanyMap `
+                -FolderMap $FolderMap `
+                -Cache $ArticleResolveCache
         }
         '^Asset$' {
+            if ($MigratedAssetMap.ContainsKey([string]$sourceId)) {
+                return [int]$MigratedAssetMap[[string]$sourceId]
+            }
             $sourceCompanyId = Get-SourceAssetCompanyId -AssetId $sourceId -Cache $SourceAssetCompanyCache
             if ($MigrationMode -eq 'SINGLE' -and $sourceCompanyId -ne 0 -and $sourceCompanyId -ne $SelectedCompanyId) {
                 return $null
@@ -216,7 +236,7 @@ function Build-TargetPasswordSourceIdMap {
         }
 
         $key = Get-PasswordLookupKey -Name $sp.name -CompanyId $targetCompanyId `
-            -PasswordFolderId 0 -Username $sp.username -Url $sp.url
+            -PasswordFolderId 0 -Username $sp.username -Url (Get-MigrationPasswordLoginUrl -Password $sp)
         if ($targetLookup.ContainsKey($key)) {
             $map[[string]$sp.id] = [int]$targetLookup[$key].id
         }
@@ -247,8 +267,9 @@ function Build-TargetWebsiteSourceIdMap {
         $targetCompanyId = $CompanyMap[[string]$site.company_id]
         if (-not $targetCompanyId) { continue }
 
-        $siteName = Get-HuduWebsiteDisplayName -Site $site
-        if (-not $siteName) { continue }
+        $rawSiteName = Get-HuduWebsiteDisplayName -Site $site
+        if (-not $rawSiteName) { continue }
+        $siteName = Get-MigrationName -Name $rawSiteName
 
         $match = $targetSites | Where-Object {
             $_.company_id -eq $targetCompanyId -and (Get-HuduWebsiteDisplayName -Site $_) -eq $siteName
@@ -263,7 +284,9 @@ function Invoke-FlagMigration {
     param(
         [hashtable]$CompanyMap,
         [hashtable]$ArticleMap,
+        [hashtable]$FolderMap = @{},
         [hashtable]$RackMap = @{},
+        [hashtable]$AssetMap = @{},
         [System.Collections.IDictionary]$Stats,
         [string]$MigrationMode,
         [int]$SelectedCompanyId
@@ -279,6 +302,8 @@ function Invoke-FlagMigration {
 
     $assetMapCache = @{}
     $sourceAssetCompanyCache = @{}
+    $articleTargetLookup = Build-ArticleTargetLookup
+    $articleResolveCache = @{}
     $targetPasswordBySourceId = Build-TargetPasswordSourceIdMap -CompanyMap $CompanyMap `
         -MigrationMode $MigrationMode -SelectedCompanyId $SelectedCompanyId
     $targetWebsiteBySourceId = Build-TargetWebsiteSourceIdMap -CompanyMap $CompanyMap `
@@ -305,16 +330,20 @@ function Invoke-FlagMigration {
         }
 
         $targetFlagableId = Resolve-MigrationFlagableId -Flag $flag `
-            -ArticleMap $ArticleMap -CompanyMap $CompanyMap -AssetMapCache $assetMapCache `
-            -SourceAssetCompanyCache $sourceAssetCompanyCache `
+            -ArticleMap $ArticleMap -ArticleTargetLookup $articleTargetLookup `
+            -ArticleResolveCache $articleResolveCache -CompanyMap $CompanyMap -FolderMap $FolderMap `
+            -AssetMapCache $assetMapCache -SourceAssetCompanyCache $sourceAssetCompanyCache `
             -TargetPasswordBySourceId $targetPasswordBySourceId `
             -TargetWebsiteBySourceId $targetWebsiteBySourceId -RackMap $RackMap `
+            -MigratedAssetMap $AssetMap `
             -MigrationMode $MigrationMode -SelectedCompanyId $SelectedCompanyId
 
         if (-not $targetFlagableId) {
             $skipReason = "no target $($flag.flagable_type) for source id $($flag.flagable_id)"
-            if ([string]$flag.flagable_type -match '^Asset$') {
-                $skipReason = "no target asset matched by name, slug, or primary serial (assets are not created by this script — add matching assets on the target first)"
+            if ([string]$flag.flagable_type -match '^Article$') {
+                $skipReason = 'no target article by source id or by migrated name + company/folder'
+            } elseif ([string]$flag.flagable_type -match '^Asset$') {
+                $skipReason = 'no target asset (not in AssetMap and no name/slug/serial match on target)'
             }
             Write-Log "Flag $($flag.id): $skipReason — skipping." "WARN"
             $Stats.FlagsSkipped++

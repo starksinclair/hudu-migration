@@ -67,7 +67,7 @@ function Invoke-PhotoFolderMigration {
             try {
                 Use-TargetHudu
                 $created = New-HuduPhotoFolderApi `
-                    -Name           $folder.name `
+                    -Name           (Get-MigrationName -Name $folder.name) `
                     -CompanyId      $TargetCompanyId `
                     -ParentFolderId ([int]$targetParentId) `
                     -Description    $(if ($folder.description) { $folder.description } else { $null })

@@ -104,7 +104,7 @@ function Invoke-PasswordMigration {
 
         try {
             Use-TargetHudu
-            $folderParams = @{ Name = $folder.name }
+            $folderParams = @{ Name = (Get-MigrationName -Name $folder.name) }
             if ($folder.description) { $folderParams.Description = $folder.description }
             if ($folder.allowed_groups -and $folder.allowed_groups.Count -gt 0) {
                 $folderParams.Security = 'specific'
@@ -162,7 +162,7 @@ function Invoke-PasswordMigration {
 
         try {
             $passwordParams = @{
-                name     = $password.name
+                name     = (Get-MigrationName -Name $password.name)
             }
             if ($null -ne $targetCompanyId) { $passwordParams['company_id'] = [int]$targetCompanyId }
             if ($password.username) { $passwordParams['username'] = $password.username }
@@ -177,9 +177,18 @@ function Invoke-PasswordMigration {
 
             if ($targetPasswordFolderId) { $passwordParams['password_folder_id'] = [int]$targetPasswordFolderId }
             if ($password.notes) { $passwordParams['notes'] = $password.notes }
-            if ($password.url) { $passwordParams['url'] = $password.url }
+            if ($password.description) { $passwordParams['description'] = $password.description }
 
-            $passwordKey = Get-PasswordLookupKey -Name $password.name -CompanyId ($targetCompanyId ?? 0)
+            $loginUrl = Get-MigrationPasswordLoginUrl -Password $password
+            if ($loginUrl) {
+                $passwordParams['login_url'] = $loginUrl
+            } elseif ($password.url -and (Test-IsHuduPasswordVaultUrl -Url $password.url)) {
+                Write-Log "Password '$($password.name)': skipping vault URL as login link ($($password.url))." "WARN"
+            }
+
+            $passwordKey = Get-PasswordLookupKey -Name $password.name -CompanyId ($targetCompanyId ?? 0) `
+                -Username $(if ($password.username) { $password.username } else { $null }) `
+                -Url $loginUrl
             if ($PasswordLookup.ContainsKey($passwordKey)) {
                 Write-Log "Password '$($password.name)' already exists inside destination company. Skipping." "INFO"
                 $Stats.PasswordsSkipped++
@@ -187,8 +196,20 @@ function Invoke-PasswordMigration {
             }
 
             Use-TargetHudu
-            $createdPwd = New-HuduPassword @passwordParams
-            $createdObj = $createdPwd.password ?? $createdPwd
+            $cmdParams = @{
+                Name = $passwordParams['name']
+            }
+            if ($passwordParams.ContainsKey('company_id')) { $cmdParams['CompanyId'] = $passwordParams['company_id'] }
+            if ($passwordParams.ContainsKey('username')) { $cmdParams['Username'] = $passwordParams['username'] }
+            if ($passwordParams.ContainsKey('password')) { $cmdParams['Password'] = $passwordParams['password'] }
+            if ($passwordParams.ContainsKey('password_folder_id')) { $cmdParams['PasswordFolderId'] = $passwordParams['password_folder_id'] }
+            if ($passwordParams.ContainsKey('description')) { $cmdParams['Description'] = $passwordParams['description'] }
+            if ($passwordParams.ContainsKey('otp_secret')) { $cmdParams['OTPSecret'] = $passwordParams['otp_secret'] }
+            if ($loginUrl) { $cmdParams['URL'] = $loginUrl }
+
+            # Hudu API: GET/POST /api/v1/asset_passwords (HuduAPI: New-HuduPassword / Get-HuduPasswords)
+            $createdPwd = New-HuduPassword @cmdParams
+            $createdObj = $createdPwd.asset_password ?? $createdPwd.password ?? $createdPwd
             if ($createdObj -and $createdObj.id) {
                 Add-PasswordLookupEntry -Lookup $PasswordLookup -Password $createdObj
             }

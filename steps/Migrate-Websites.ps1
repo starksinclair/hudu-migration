@@ -38,7 +38,7 @@ function Invoke-WebsiteMigration {
             continue
         }
 
-        $siteName = Get-HuduWebsiteDisplayName -Site $site
+        $siteName = Get-MigrationName -Name (Get-HuduWebsiteDisplayName -Site $site)
         if (-not $siteName) {
             $idLabel = if ($site.id) { $site.id } else { 'unknown' }
             Write-Log "Website (ID $idLabel) has no name or URL — skipping." "WARN"

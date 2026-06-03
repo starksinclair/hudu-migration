@@ -213,6 +213,7 @@ function Invoke-RackItemMigration {
 function Invoke-RackMigration {
     param(
         [hashtable]$CompanyMap,
+        [hashtable]$AssetMap = @{},
         [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
         [int]      $SelectedCompanyId
@@ -279,7 +280,7 @@ function Invoke-RackMigration {
         }
 
         $existing = $targetRacks | Where-Object {
-            $_.name -eq $rack.name -and [string]$_.company_id -eq [string]$targetCompanyId
+            $_.name -eq (Get-MigrationName -Name $rack.name) -and [string]$_.company_id -eq [string]$targetCompanyId
         } | Select-Object -First 1
 
         $targetRackId = $null
@@ -305,7 +306,7 @@ function Invoke-RackMigration {
             try {
                 Use-TargetHudu
                 $params = @{
-                    Name      = $rack.name
+                    Name      = (Get-MigrationName -Name $rack.name)
                     CompanyId = [int]$targetCompanyId
                     Height    = $height
                     Width     = $width
@@ -340,10 +341,21 @@ function Invoke-RackMigration {
 
         if ($rackItems.Count -eq 0) { continue }
 
-        $assetMap = Get-CompanyAssetMap `
+        $assetMap = @{}
+        if ($AssetMap -and $AssetMap.Count -gt 0) {
+            foreach ($entry in $AssetMap.GetEnumerator()) {
+                $assetMap[$entry.Key] = $entry.Value
+            }
+        }
+        $nameMap = Get-CompanyAssetMap `
             -SourceCompanyId ([int]($rack.company_id)) `
             -TargetCompanyId ([int]$targetCompanyId) `
             -Cache $assetMapCache
+        foreach ($entry in $nameMap.GetEnumerator()) {
+            if (-not $assetMap.ContainsKey($entry.Key)) {
+                $assetMap[$entry.Key] = $entry.Value
+            }
+        }
 
         foreach ($item in $rackItems) {
             Invoke-RackItemMigration `

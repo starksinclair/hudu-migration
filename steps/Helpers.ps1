@@ -4,7 +4,22 @@
 # Functions here rely on these variables being set in the caller's scope:
 #   $LogFile, $LogDir, $SourceHuduUrl, $TargetHuduUrl,
 #   $SourceHuduApiKeySecure, $TargetHuduApiKeySecure
+#   $script:MigrationInstanceCount (1 = same instance test, 2 = normal)
+#   $script:MigrationTestNameSuffix (appended to names when instance count is 1)
 # ============================================================================
+
+# When MigrationInstanceCount is 1, source and target are the same Hudu tenant.
+# New records use a suffix on the name so creates do not collide with existing rows.
+function Get-MigrationName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $Name }
+    if ($script:MigrationInstanceCount -ne 1) { return $Name }
+
+    $suffix = $script:MigrationTestNameSuffix
+    if ([string]::IsNullOrWhiteSpace($suffix)) { $suffix = ' [MIG-TEST]' }
+    if ($Name.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)) { return $Name }
+    return "$Name$suffix"
+}
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -95,6 +110,27 @@ function ConvertTo-HuduApiStringFlag {
     $text = [string]$Value
     if ([string]::IsNullOrWhiteSpace($text)) { return $null }
     return $text.ToLowerInvariant()
+}
+
+# Description fields in Hudu are plain text; strip HTML when source used rich-text markup.
+function ConvertTo-HuduPlainDescription {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+    $plain = [string]$Text
+    $plain = $plain -replace '<(br|p|div|li|tr|h[1-6])\s*/?\s*>', "`n"
+    $plain = $plain -replace '</(p|div|li|tr|h[1-6])>', "`n"
+    $plain = $plain -replace '<[^>]+>', ''
+    $plain = $plain -replace '&nbsp;', ' '
+    $plain = $plain -replace '&amp;', '&'
+    $plain = $plain -replace '&lt;', '<'
+    $plain = $plain -replace '&gt;', '>'
+    $plain = $plain -replace '&quot;', '"'
+    $plain = $plain -replace '&#39;', "'"
+    $plain = ($plain -split "`n" | ForEach-Object { $_.Trim() }) -join "`n"
+    $plain = $plain.Trim()
+    if ([string]::IsNullOrWhiteSpace($plain)) { return $null }
+    return $plain
 }
 
 # POST/PUT JSON to Hudu without HuduAPI's retry console spam (Invoke-HuduRequest is module-private).
@@ -345,7 +381,8 @@ function Get-FolderLookupKey {
     param([string]$Name, [object]$CompanyId, [object]$ParentFolderId)
     $c = if ($CompanyId)      { [string]$CompanyId }      else { '0' }
     $p = if ($ParentFolderId) { [string]$ParentFolderId } else { '0' }
-    return ('{0}|{1}|{2}' -f $Name.Trim().ToLowerInvariant(), $c, $p)
+    $n = (Get-MigrationName -Name $Name).Trim().ToLowerInvariant()
+    return ('{0}|{1}|{2}' -f $n, $c, $p)
 }
 
 function Add-FolderLookupEntry {
@@ -360,6 +397,46 @@ function Add-FolderLookupEntry {
 
 # ---- Password migration helpers --------------------------------------------------
 
+function Test-IsHuduPasswordVaultUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
+    try {
+        $path = ([Uri]$Url).AbsolutePath.TrimEnd('/')
+        return $path -match '/passwords/[^/]+$'
+    } catch {
+        return $false
+    }
+}
+
+# Site/login URL for a password record — not the Hudu vault link in the API "url" field.
+function Get-MigrationPasswordLoginUrl {
+    param([object]$Password)
+
+    $candidate = $null
+    if ($Password.PSObject.Properties['login_url'] -and -not [string]::IsNullOrWhiteSpace([string]$Password.login_url)) {
+        $candidate = [string]$Password.login_url
+    } elseif ($Password.PSObject.Properties['url'] -and -not [string]::IsNullOrWhiteSpace([string]$Password.url)) {
+        $candidate = [string]$Password.url
+    }
+
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $null }
+    if (Test-IsHuduPasswordVaultUrl -Url $candidate) { return $null }
+
+    if ($script:SourceHuduUrl -and $script:TargetHuduUrl) {
+        try {
+            $sourceHost = ([Uri]$script:SourceHuduUrl.TrimEnd('/')).Host
+            $targetBase = $script:TargetHuduUrl.TrimEnd('/')
+            $uri = [Uri]$candidate
+            if ($uri.Host -eq $sourceHost -and -not (Test-IsHuduPasswordVaultUrl -Url $candidate)) {
+                $candidate = '{0}{1}' -f $targetBase, $uri.PathAndQuery
+            }
+        } catch { }
+    }
+
+    return $candidate
+}
+
 function Get-PasswordFolderLookupKey {
     param(
         [string]$Name,
@@ -367,7 +444,8 @@ function Get-PasswordFolderLookupKey {
     )
 
     $companyValue = ($null -ne $CompanyId) ? [string]$CompanyId : '0'
-    return ('{0}|{1}' -f $Name.Trim().ToLowerInvariant(), $companyValue)
+    $n = (Get-MigrationName -Name $Name).Trim().ToLowerInvariant()
+    return ('{0}|{1}' -f $n, $companyValue)
 }
 
 function Add-PasswordFolderLookupEntry {
@@ -396,7 +474,8 @@ function Get-PasswordLookupKey {
     $folderValue  = ($null -ne $PasswordFolderId) ? [string]$PasswordFolderId : '0'
     $userValue    = if ($Username) { $Username.Trim().ToLowerInvariant() } else { '0' }
     $urlValue     = if ($Url) { $Url.Trim().ToLowerInvariant() } else { '0' }
-    return ('{0}|{1}|{2}|{3}|{4}' -f $Name.Trim().ToLowerInvariant(), $companyValue, $folderValue, $userValue, $urlValue)
+    $n = (Get-MigrationName -Name $Name).Trim().ToLowerInvariant()
+    return ('{0}|{1}|{2}|{3}|{4}' -f $n, $companyValue, $folderValue, $userValue, $urlValue)
 }
 
 function Add-PasswordLookupEntry {
@@ -409,7 +488,7 @@ function Add-PasswordLookupEntry {
         $companyId = ($Password.PSObject.Properties['company_id'] -and $Password.company_id) ? [int]$Password.company_id : $null
         $folderId  = ($Password.PSObject.Properties['password_folder_id'] -and $Password.password_folder_id) ? [int]$Password.password_folder_id : $null
         $username  = ($Password.PSObject.Properties['username'] -and $Password.username) ? [string]$Password.username : $null
-        $url       = ($Password.PSObject.Properties['url'] -and $Password.url) ? [string]$Password.url : $null
+        $url       = Get-MigrationPasswordLoginUrl -Password $Password
         $key = Get-PasswordLookupKey -Name $Password.name -CompanyId $companyId -PasswordFolderId $folderId -Username $username -Url $url
         if (-not $Lookup.ContainsKey($key)) { $Lookup[$key] = $Password }
     }
@@ -440,11 +519,19 @@ function Find-TargetAssetMatch {
     )
 
     if (-not $SourceAsset) { return $null }
+    if ($null -eq $TargetAssets) { return $null }
+
+    $TargetAssets = @($TargetAssets | Where-Object { $_ })
+    if ($TargetAssets.Count -eq 0) { return $null }
 
     if ($SourceAsset.name) {
         $name = [string]$SourceAsset.name.Trim()
+        $migratedName = Get-MigrationName -Name $name
         $byName = $TargetAssets | Where-Object {
-            $_.name -and [string]$_.name.Trim().Equals($name, [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $_.name) { return $false }
+            $tn = [string]$_.name.Trim()
+            $tn.Equals($name, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $tn.Equals($migratedName, [System.StringComparison]::OrdinalIgnoreCase)
         } | Select-Object -First 1
         if ($byName) { return $byName }
     }
@@ -493,6 +580,213 @@ function Get-CompanyAssetMap {
     return $map
 }
 
+function ConvertTo-AssetCustomFieldKey {
+    param([string]$Label)
+    # Match HuduAPI / Hudu asset API: spaces → underscores, then lowercase (other chars kept).
+    if ([string]::IsNullOrWhiteSpace($Label)) { return $null }
+    return $Label.Trim().Replace(' ', '_').ToLowerInvariant()
+}
+
+function ConvertTo-MigrationRelationType {
+    param([string]$Type)
+    if ([string]::IsNullOrWhiteSpace($Type)) { return $Type }
+    $norm = $Type.Trim().ToLowerInvariant() -replace '[^a-z0-9]', ''
+    switch ($norm) {
+        'assetpassword' { return 'AssetPassword' }
+        'rackstorage'   { return 'RackStorage' }
+        'ipaddress'     { return 'IpAddress' }
+        'vlanzone'      { return 'VlanZone' }
+        'article'       { return 'Article' }
+        'company'       { return 'Company' }
+        'website'       { return 'Website' }
+        'network'       { return 'Network' }
+        'asset'         { return 'Asset' }
+        'procedure'     { return 'Procedure' }
+        'vlan'          { return 'Vlan' }
+        default         { return $Type.Trim() }
+    }
+}
+
+function Get-MigrationRelationPairKey {
+    param(
+        [string]$FromType,
+        [int]$FromId,
+        [string]$ToType,
+        [int]$ToId
+    )
+
+    $fromKey = '{0}|{1}' -f (ConvertTo-MigrationRelationType -Type $FromType), $FromId
+    $toKey   = '{0}|{1}' -f (ConvertTo-MigrationRelationType -Type $ToType), $ToId
+    $sorted  = @($fromKey, $toKey) | Sort-Object
+    return '{0}<>{1}' -f $sorted[0], $sorted[1]
+}
+
+function ConvertTo-HuduAssetCustomFieldsPayload {
+    param([hashtable]$FieldValues)
+
+    if (-not $FieldValues -or $FieldValues.Count -eq 0) { return @() }
+
+    $payload = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $FieldValues.GetEnumerator()) {
+        $null = $payload.Add(@{ $entry.Key = $entry.Value })
+    }
+    return @($payload.ToArray())
+}
+
+function Get-MigrationListMap {
+    Use-SourceHudu
+    $sourceLists = @(Get-HuduObjectList -Response (Get-HuduLists) -CollectionNames @('lists'))
+    Use-TargetHudu
+    $targetLists = @(Get-HuduObjectList -Response (Get-HuduLists) -CollectionNames @('lists'))
+    $targetByName = @{}
+    foreach ($tl in $targetLists) {
+        if ($tl.name) { $targetByName[[string]$tl.name.Trim().ToLowerInvariant()] = $tl }
+    }
+
+    $map = @{}
+    foreach ($sl in $sourceLists) {
+        if (-not $sl.id) { continue }
+        $norm = if ($sl.name) { [string]$sl.name.Trim().ToLowerInvariant() } else { '' }
+        if ($norm -and $targetByName.ContainsKey($norm)) {
+            $map[[string]$sl.id] = [int]$targetByName[$norm].id
+            continue
+        }
+        try {
+            $items = @()
+            if ($sl.PSObject.Properties['items'] -and $sl.items) { $items = @($sl.items) }
+            $created = New-HuduList -Name $sl.name -Items $items
+            $newList = $created.list ?? $created
+            if ($newList.id) {
+                $map[[string]$sl.id] = [int]$newList.id
+                $targetByName[$norm] = $newList
+            }
+        } catch {
+            Write-Log "Could not create target list '$($sl.name)': $_" "WARN"
+        }
+    }
+    return $map
+}
+
+function ConvertTo-MigrationAssetLayoutField {
+    param(
+        [object]$Field,
+        [hashtable]$ListMap,
+        [hashtable]$LayoutMap
+    )
+
+    if ($Field.PSObject.Properties['is_destroyed'] -and $Field.is_destroyed) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$Field.label)) { return $null }
+
+    $def = @{
+        label        = [string]$Field.label
+        field_type   = [string]$Field.field_type
+        show_in_list = [bool]($Field.show_in_list ?? $false)
+        required     = [bool]($Field.required ?? $false)
+    }
+    if ($Field.PSObject.Properties['hint'] -and $null -ne $Field.hint) { $def['hint'] = [string]$Field.hint }
+    if ($Field.PSObject.Properties['position'] -and $null -ne $Field.position) { $def['position'] = [int]$Field.position }
+    if ($Field.PSObject.Properties['min'] -and $null -ne $Field.min) { $def['min'] = $Field.min }
+    if ($Field.PSObject.Properties['max'] -and $null -ne $Field.max) { $def['max'] = $Field.max }
+    if ($Field.PSObject.Properties['expiration'] -and $null -ne $Field.expiration) { $def['expiration'] = [bool]$Field.expiration }
+    if ($Field.PSObject.Properties['multiple_options'] -and $null -ne $Field.multiple_options) {
+        $def['multiple_options'] = [bool]$Field.multiple_options
+    }
+    if ($Field.PSObject.Properties['options'] -and $Field.options) { $def['options'] = [string]$Field.options }
+
+    if ($Field.field_type -eq 'ListSelect' -and $Field.list_id -and $ListMap.ContainsKey([string]$Field.list_id)) {
+        $def['list_id'] = [int]$ListMap[[string]$Field.list_id]
+    }
+    if ($Field.field_type -eq 'AssetTag' -and $Field.linkable_id -and $LayoutMap.ContainsKey([string]$Field.linkable_id)) {
+        $def['linkable_id'] = [int]$LayoutMap[[string]$Field.linkable_id]
+    }
+
+    return $def
+}
+
+function ConvertTo-MigrationAssetFieldValues {
+    param(
+        [object]$SourceAsset,
+        [object]$TargetLayoutDetail,
+        [hashtable]$AssetMap = @{}
+    )
+
+    $values = @{}
+    if (-not $SourceAsset.fields) { return $values }
+
+    $targetFieldByLabel = @{}
+    if ($TargetLayoutDetail -and $TargetLayoutDetail.fields) {
+        foreach ($tf in @($TargetLayoutDetail.fields)) {
+            if ($tf.label) { $targetFieldByLabel[[string]$tf.label.Trim().ToLowerInvariant()] = $tf }
+        }
+    }
+
+    foreach ($sf in @($SourceAsset.fields)) {
+        if ($null -eq $sf.value) { continue }
+        if ($sf.value -is [string] -and [string]::IsNullOrWhiteSpace([string]$sf.value)) { continue }
+
+        $label = if ($sf.label) { [string]$sf.label } else { $null }
+        if (-not $label) { continue }
+
+        $targetField = $null
+        $norm = $label.Trim().ToLowerInvariant()
+        if ($targetFieldByLabel.ContainsKey($norm)) { $targetField = $targetFieldByLabel[$norm] }
+        if (-not $targetField) { continue }
+
+        $keyLabel = [string]$targetField.label
+        $key = ConvertTo-AssetCustomFieldKey -Label $keyLabel
+        if (-not $key) { continue }
+
+        $fieldType = if ($targetField.field_type) { [string]$targetField.field_type } else { $null }
+
+        if ($fieldType -eq 'AssetTag') {
+            $mapped = @()
+            foreach ($rawId in @($sf.value)) {
+                $sid = [string]$rawId
+                if ($AssetMap.ContainsKey($sid)) { $mapped += [int]$AssetMap[$sid] }
+            }
+            if ($mapped.Count -eq 0) { continue }
+            $values[$key] = @($mapped)
+            continue
+        }
+
+        if ($fieldType -eq 'ListSelect') {
+            if ($sf.value -is [System.Array]) {
+                $values[$key] = @($sf.value | ForEach-Object { [string]$_ })
+            } else {
+                $values[$key] = @([string]$sf.value)
+            }
+            continue
+        }
+
+        if ($fieldType -eq 'CheckBox') {
+            $values[$key] = if ($sf.value -is [bool]) { $(if ($sf.value) { 'true' } else { 'false' }) } else { [string]$sf.value }
+            continue
+        }
+
+        if ($fieldType -eq 'Date') {
+            $parsed = $null
+            if ($sf.value -is [datetime]) {
+                $parsed = $sf.value
+            } elseif ([datetime]::TryParse([string]$sf.value, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+            } elseif ([datetime]::TryParse([string]$sf.value, [ref]$parsed)) {
+            }
+            if ($parsed) {
+                $values[$key] = $parsed.ToString('yyyy/MM/dd')
+            }
+            continue
+        }
+
+        if ($fieldType -eq 'Number') {
+            $values[$key] = [string]$sf.value
+            continue
+        }
+
+        $values[$key] = $sf.value
+    }
+
+    return $values
+}
+
 function Get-FlagDedupeKey {
     param(
         [string]$FlagableType,
@@ -507,9 +801,151 @@ function Get-FlagDedupeKey {
     return ('{0}|{1}|{2}|{3}' -f $type, $FlagableId, $FlagTypeId, $desc)
 }
 
+function Get-ArticleLookupKey {
+    param(
+        [string]$Name,
+        [object]$CompanyId,
+        [object]$FolderId
+    )
+
+    $companyValue = ($null -ne $CompanyId) ? [string]$CompanyId : '0'
+    $folderValue  = ($null -ne $FolderId)  ? [string]$FolderId  : '0'
+    $n            = (Get-MigrationName -Name $Name).Trim().ToLowerInvariant()
+    return ('{0}|{1}|{2}' -f $n, $companyValue, $folderValue)
+}
+
+function Add-ArticleLookupEntry {
+    param(
+        [hashtable]$Lookup,
+        [object]$Article
+    )
+
+    if (-not $Article -or -not $Article.name) { return }
+    $companyId = ($Article.PSObject.Properties['company_id'] -and $Article.company_id) ? [int]$Article.company_id : 0
+    $folderId  = ($Article.PSObject.Properties['folder_id'] -and $Article.folder_id) ? [int]$Article.folder_id : 0
+    $key       = Get-ArticleLookupKey -Name $Article.name -CompanyId $companyId -FolderId $folderId
+    if (-not $Lookup.ContainsKey($key)) { $Lookup[$key] = [int]$Article.id }
+    if ($folderId -ne 0) {
+        $keyAnyFolder = Get-ArticleLookupKey -Name $Article.name -CompanyId $companyId -FolderId 0
+        if (-not $Lookup.ContainsKey($keyAnyFolder)) { $Lookup[$keyAnyFolder] = [int]$Article.id }
+    }
+}
+
+function Find-ArticleTargetIdByMigratedName {
+    param(
+        [string]$SourceName,
+        [int]$TargetCompanyId,
+        [hashtable]$ArticleTargetLookup
+    )
+
+    $migrated = (Get-MigrationName -Name $SourceName).Trim().ToLowerInvariant()
+    $prefix   = '{0}|{1}|' -f $migrated, $TargetCompanyId
+    foreach ($kv in $ArticleTargetLookup.GetEnumerator()) {
+        if ($kv.Key.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [int]$kv.Value
+        }
+    }
+    return $null
+}
+
+function Resolve-MigrationArticleTargetId {
+    param(
+        [int]$SourceArticleId,
+        [hashtable]$ArticleMap,
+        [hashtable]$ArticleTargetLookup,
+        [hashtable]$CompanyMap,
+        [hashtable]$FolderMap,
+        [hashtable]$Cache
+    )
+
+    $entry = $ArticleMap[[string]$SourceArticleId]
+    if ($entry) { return [int]$entry.TargetId }
+
+    $cacheKey = "article:$SourceArticleId"
+    if ($Cache.ContainsKey($cacheKey)) {
+        $cached = $Cache[$cacheKey]
+        if ($cached) { return [int]$cached }
+        return $null
+    }
+
+    $targetId = $null
+    try {
+        Use-SourceHudu
+        $raw = Get-HuduArticles -Id $SourceArticleId
+        $src = $raw.article ?? $raw
+        if ($src -and $src.name) {
+            foreach ($mapped in $ArticleMap.Values) {
+                if ($mapped.Name -eq $src.name) {
+                    $Cache[$cacheKey] = [int]$mapped.TargetId
+                    return [int]$mapped.TargetId
+                }
+            }
+
+            $targetCompanyId = 0
+            if ($src.company_id -and $src.company_id -ne 0) {
+                $targetCompanyId = $CompanyMap[[string]$src.company_id]
+                if (-not $targetCompanyId) {
+                    $Cache[$cacheKey] = $null
+                    return $null
+                }
+            }
+            $targetFolderId = 0
+            if ($src.folder_id -and $src.folder_id -ne 0) {
+                $targetFolderId = $FolderMap[[string]$src.folder_id]
+                if (-not $targetFolderId) { $targetFolderId = 0 }
+            }
+            $key = Get-ArticleLookupKey -Name $src.name -CompanyId $targetCompanyId -FolderId $targetFolderId
+            if ($ArticleTargetLookup.ContainsKey($key)) {
+                $targetId = [int]$ArticleTargetLookup[$key]
+            }
+            if (-not $targetId -and $targetFolderId -ne 0) {
+                $keyNoFolder = Get-ArticleLookupKey -Name $src.name -CompanyId $targetCompanyId -FolderId 0
+                if ($ArticleTargetLookup.ContainsKey($keyNoFolder)) {
+                    $targetId = [int]$ArticleTargetLookup[$keyNoFolder]
+                }
+            }
+            if (-not $targetId -and $targetCompanyId) {
+                $targetId = Find-ArticleTargetIdByMigratedName -SourceName $src.name `
+                    -TargetCompanyId $targetCompanyId -ArticleTargetLookup $ArticleTargetLookup
+            }
+        }
+    } catch {
+        Write-Log "Could not resolve article flag target for source article $SourceArticleId : $_" "WARN"
+    }
+
+    $Cache[$cacheKey] = $targetId
+    return $targetId
+}
+
+function New-MigrationProcedureTask {
+    param(
+        [Parameter(Mandatory)]
+        [int]$ProcedureId,
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [string]$Description,
+        [int]$Position = 0,
+        [int]$ParentTaskId = 0
+    )
+
+    $task = @{
+        name         = $Name
+        procedure_id = $ProcedureId
+    }
+    if ($Description) { $task['description'] = $Description }
+    if ($Position)    { $task['position']    = $Position }
+    if ($ParentTaskId -gt 0) { $task['parent_task_id'] = $ParentTaskId }
+
+    $response = Invoke-HuduJsonApi -Method POST -Resource '/api/v1/procedure_tasks' -Body @{
+        procedure_task = $task
+    }
+    return $response.procedure_task ?? $response
+}
+
 function Get-FlagTypeLookupKey {
     param([object]$FlagType)
-    $name  = if ($FlagType.name)  { [string]$FlagType.name.Trim().ToLowerInvariant() }  else { '' }
+    $rawName = if ($FlagType.name) { [string]$FlagType.name } else { '' }
+    $name  = (Get-MigrationName -Name $rawName).Trim().ToLowerInvariant()
     $color = if ($FlagType.color) { [string]$FlagType.color.Trim().ToLowerInvariant() } else { '' }
     return '{0}|{1}' -f $name, $color
 }

@@ -36,6 +36,7 @@ $_stepsDir = Join-Path $PSScriptRoot 'steps'
 . (Join-Path $_stepsDir 'Helpers.ps1')
 . (Join-Path $_stepsDir 'CompanySelector.ps1')
 . (Join-Path $_stepsDir 'Migrate-Companies.ps1')
+. (Join-Path $_stepsDir 'Migrate-AssetLayouts.ps1')
 . (Join-Path $_stepsDir 'Migrate-Folders.ps1')
 . (Join-Path $_stepsDir 'Migrate-Articles.ps1')
 . (Join-Path $_stepsDir 'Migrate-Passwords.ps1')
@@ -44,24 +45,50 @@ $_stepsDir = Join-Path $PSScriptRoot 'steps'
 . (Join-Path $_stepsDir 'Migrate-Websites.ps1')
 . (Join-Path $_stepsDir 'Migrate-IPAM.ps1')
 . (Join-Path $_stepsDir 'Migrate-CompanyPhotos.ps1')
+. (Join-Path $_stepsDir 'Migrate-Assets.ps1')
 . (Join-Path $_stepsDir 'Migrate-Racks.ps1')
+. (Join-Path $_stepsDir 'Migrate-Relations.ps1')
 . (Join-Path $_stepsDir 'Migrate-Flags.ps1')
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-$SourceHuduUrl = 'https://docs.msp4.com' ?? (Read-Host "Source Hudu URL (e.g. https://source.hudu.com)")
-$TargetHuduUrl = 'https://naahia.huducloud.com' ?? (Read-Host "Target Hudu URL (e.g. https://target.hudu.com)")
+do {
+    $instanceInput = Read-Host "How many Hudu instances? Enter 1 (same instance — test mode) or 2 (source and target) [2]"
+    if ([string]::IsNullOrWhiteSpace($instanceInput)) { $instanceInput = '2' }
+} while ($instanceInput -notin @('1', '2'))
 
-$SourceHuduUrl = $SourceHuduUrl.TrimEnd('/')
-$TargetHuduUrl = $TargetHuduUrl.TrimEnd('/')
+$script:MigrationInstanceCount = [int]$instanceInput
+$script:MigrationTestNameSuffix = if ($MigrationTestNameSuffix) { $MigrationTestNameSuffix } else { ' [MIG-TEST]' }
 
-if (-not $SourceHuduApiKeySecure) {
-    $SourceHuduApiKeySecure = Read-Host "Source Hudu API Key" -AsSecureString
-}
-if (-not $TargetHuduApiKeySecure) {
-    $TargetHuduApiKeySecure = Read-Host "Target Hudu API Key" -AsSecureString
+if ($script:MigrationInstanceCount -eq 1) {
+    Write-Host "`nSingle-instance test mode: source and target are the same tenant." -ForegroundColor Yellow
+    Write-Host "New records are created with name suffix '$($script:MigrationTestNameSuffix)' to avoid duplicate-name errors.`n" -ForegroundColor Yellow
+
+    if (-not $SourceHuduUrl) {
+        $SourceHuduUrl = Read-Host "Hudu URL (e.g. https://your.hudu.com)"
+    }
+    $SourceHuduUrl = $SourceHuduUrl.TrimEnd('/')
+    $TargetHuduUrl   = $SourceHuduUrl
+
+    if (-not $SourceHuduApiKeySecure) {
+        $SourceHuduApiKeySecure = Read-Host "Hudu API Key" -AsSecureString
+    }
+    $TargetHuduApiKeySecure = $SourceHuduApiKeySecure
+} else {
+    $SourceHuduUrl = $SourceHuduUrl ?? (Read-Host "Source Hudu URL (e.g. https://source.hudu.com)")
+    $TargetHuduUrl = $TargetHuduUrl ?? (Read-Host "Target Hudu URL (e.g. https://target.hudu.com)")
+
+    $SourceHuduUrl = $SourceHuduUrl.TrimEnd('/')
+    $TargetHuduUrl = $TargetHuduUrl.TrimEnd('/')
+
+    if (-not $SourceHuduApiKeySecure) {
+        $SourceHuduApiKeySecure = Read-Host "Source Hudu API Key" -AsSecureString
+    }
+    if (-not $TargetHuduApiKeySecure) {
+        $TargetHuduApiKeySecure = Read-Host "Target Hudu API Key" -AsSecureString
+    }
 }
 
 if ($SourceHuduApiKeySecure -isnot [System.Security.SecureString] -or
@@ -96,6 +123,7 @@ try {
     Set-HapiErrorsDirectory -Path $LogDir | Out-Null
 
     Write-Log "=== Hudu-to-Hudu Migration Started ==="
+    Write-Log "Instances: $script:MigrationInstanceCount $(if ($script:MigrationInstanceCount -eq 1) { "(same-tenant test; suffix '$script:MigrationTestNameSuffix')" } else { '(source → target)' })"
     Write-Log "Source : $SourceHuduUrl"
     Write-Log "Target : $TargetHuduUrl"
 
@@ -147,19 +175,24 @@ try {
     # [System.Collections.IDictionary], not [hashtable]; binding [ordered] to [hashtable] copies it.
     $Stats = [ordered]@{
         CompaniesCreated   = 0; CompaniesSkipped  = 0; CompaniesFailed   = 0
+        AssetLayoutsCreated = 0; AssetLayoutsSkipped = 0; AssetLayoutsFailed = 0
         FoldersCreated     = 0; FoldersFailed     = 0
-        ArticlesCreated    = 0; ArticlesFailed    = 0
+        ArticlesCreated    = 0; ArticlesSkipped   = 0; ArticlesFailed    = 0
         FilesUploaded      = 0; FilesSkipped      = 0; FilesFailed       = 0
         PasswordsCreated   = 0; PasswordsSkipped  = 0; PasswordsFailed   = 0
         ProceduresCreated  = 0; ProceduresSkipped = 0; ProceduresFailed  = 0
         TasksCreated       = 0; TasksFailed       = 0
         WebsitesCreated    = 0; WebsitesSkipped   = 0; WebsitesFailed    = 0
         NetworksCreated    = 0; NetworksSkipped   = 0; NetworksFailed    = 0
-        IPsCreated         = 0; IPsFailed         = 0
+        VlanZonesCreated   = 0; VlanZonesSkipped  = 0; VlanZonesFailed   = 0
+        VlansCreated       = 0; VlansSkipped      = 0; VlansFailed       = 0
+        IPsCreated         = 0; IPsSkipped        = 0; IPsFailed         = 0
         PhotoFoldersCreated = 0; PhotoFoldersSkipped = 0; PhotoFoldersFailed = 0
         PhotosUploaded     = 0; PhotosFailed      = 0
         RacksCreated       = 0; RacksSkipped      = 0; RacksFailed       = 0
         RackItemsCreated   = 0; RackItemsSkipped  = 0; RackItemsFailed   = 0
+        AssetsCreated      = 0; AssetsSkipped     = 0; AssetsFailed      = 0
+        RelationsCreated   = 0; RelationsSkipped  = 0; RelationsFailed   = 0
         FlagTypesCreated   = 0; FlagTypesSkipped  = 0; FlagTypesFailed   = 0
         FlagsCreated       = 0; FlagsSkipped      = 0; FlagsDuplicatesSkipped = 0; FlagsFailed = 0
     }
@@ -174,6 +207,12 @@ try {
         -Stats              $Stats `
         -MigrationMode      $migrationMode `
         -SelectedCompanyId  $selectedCompanyId
+
+    $layoutMigration = Invoke-AssetLayoutMigration `
+        -Stats              $Stats `
+        -MigrationMode      $migrationMode `
+        -SelectedCompanyId  $selectedCompanyId
+    $LayoutMap = $layoutMigration.LayoutMap
 
     $FolderMap = Invoke-FolderMigration `
         -CompanyMap         $CompanyMap `
@@ -232,8 +271,27 @@ try {
         -TempPath          $TempPath `
         -MaxFileSizeMB     $MaxFileSizeMB
 
+    $AssetMap = Invoke-AssetMigration `
+        -CompanyMap        $CompanyMap `
+        -LayoutMap         $LayoutMap `
+        -LayoutFieldMap    $layoutMigration.LayoutFieldMap `
+        -Stats             $Stats `
+        -MigrationMode     $migrationMode `
+        -SelectedCompanyId $selectedCompanyId
+
     $RackMap = Invoke-RackMigration `
         -CompanyMap        $CompanyMap `
+        -AssetMap          $AssetMap `
+        -Stats             $Stats `
+        -MigrationMode     $migrationMode `
+        -SelectedCompanyId $selectedCompanyId
+
+    Invoke-RelationMigration `
+        -CompanyMap        $CompanyMap `
+        -ArticleMap        $ArticleMap `
+        -AssetMap          $AssetMap `
+        -RackMap           $RackMap `
+        -NetworkMap        $NetworkMap `
         -Stats             $Stats `
         -MigrationMode     $migrationMode `
         -SelectedCompanyId $selectedCompanyId
@@ -241,7 +299,9 @@ try {
     Invoke-FlagMigration `
         -CompanyMap        $CompanyMap `
         -ArticleMap       $ArticleMap `
+        -FolderMap        $FolderMap `
         -RackMap           $RackMap `
+        -AssetMap          $AssetMap `
         -Stats             $Stats `
         -MigrationMode     $migrationMode `
         -SelectedCompanyId $selectedCompanyId
@@ -255,8 +315,9 @@ try {
     Write-Log "=========================================="
     Write-Log "Mode       : $migrationMode"
     Write-Log "Companies  - Created: $($Stats.CompaniesCreated) | Matched: $($Stats.CompaniesSkipped) | Failed: $($Stats.CompaniesFailed)"
+    Write-Log "Layouts    - Created: $($Stats.AssetLayoutsCreated) | Skipped: $($Stats.AssetLayoutsSkipped) | Failed: $($Stats.AssetLayoutsFailed)"
     Write-Log "Folders    - Created: $($Stats.FoldersCreated) | Failed: $($Stats.FoldersFailed)"
-    Write-Log "Articles   - Created: $($Stats.ArticlesCreated) | Failed: $($Stats.ArticlesFailed)"
+    Write-Log "Articles   - Created: $($Stats.ArticlesCreated) | Matched: $($Stats.ArticlesSkipped) | Failed: $($Stats.ArticlesFailed)"
     Write-Log "Passwords  - Created: $($Stats.PasswordsCreated) | Failed: $($Stats.PasswordsFailed)"
     Write-Log "Files      - Uploaded: $($Stats.FilesUploaded) | Skipped: $($Stats.FilesSkipped) | Failed: $($Stats.FilesFailed)"
     Write-Log "Relinking  - Updated: $($relinkResult.Updated) | Failed: $($relinkResult.Failed)"
@@ -264,17 +325,21 @@ try {
     Write-Log "Tasks      - Created: $($Stats.TasksCreated) | Failed: $($Stats.TasksFailed)"
     Write-Log "Websites   - Created: $($Stats.WebsitesCreated) | Skipped: $($Stats.WebsitesSkipped) | Failed: $($Stats.WebsitesFailed)"
     Write-Log "Networks   - Created: $($Stats.NetworksCreated) | Skipped: $($Stats.NetworksSkipped) | Failed: $($Stats.NetworksFailed)"
-    Write-Log "IPs        - Created: $($Stats.IPsCreated) | Failed: $($Stats.IPsFailed)"
+    Write-Log "Vlan zones - Created: $($Stats.VlanZonesCreated) | Skipped: $($Stats.VlanZonesSkipped) | Failed: $($Stats.VlanZonesFailed)"
+    Write-Log "Vlans      - Created: $($Stats.VlansCreated) | Skipped: $($Stats.VlansSkipped) | Failed: $($Stats.VlansFailed)"
+    Write-Log "IPs        - Created: $($Stats.IPsCreated) | Skipped: $($Stats.IPsSkipped) | Failed: $($Stats.IPsFailed)"
     Write-Log "Photo flds - Created: $($Stats.PhotoFoldersCreated) | Skipped: $($Stats.PhotoFoldersSkipped) | Failed: $($Stats.PhotoFoldersFailed)"
     Write-Log "Photos     - Uploaded: $($Stats.PhotosUploaded) | Failed: $($Stats.PhotosFailed)"
     Write-Log "Racks      - Created: $($Stats.RacksCreated) | Skipped: $($Stats.RacksSkipped) | Failed: $($Stats.RacksFailed)"
     Write-Log "Rack items - Created: $($Stats.RackItemsCreated) | Skipped: $($Stats.RackItemsSkipped) | Failed: $($Stats.RackItemsFailed)"
+    Write-Log "Assets     - Created: $($Stats.AssetsCreated) | Skipped: $($Stats.AssetsSkipped) | Failed: $($Stats.AssetsFailed)"
+    Write-Log "Relations  - Created: $($Stats.RelationsCreated) | Skipped: $($Stats.RelationsSkipped) | Failed: $($Stats.RelationsFailed)"
     Write-Log "Flag types - Created: $($Stats.FlagTypesCreated) | Matched: $($Stats.FlagTypesSkipped) | Failed: $($Stats.FlagTypesFailed)"
     Write-Log "Flags      - Created: $($Stats.FlagsCreated) | Skipped: $($Stats.FlagsSkipped) | Duplicates: $($Stats.FlagsDuplicatesSkipped) | Failed: $($Stats.FlagsFailed)"
     Write-Log "Log        : $LogFile"
     Write-Log "Data       : $LogDir"
 
-    Write-Host "`nMappings in session: `$CompanyMap, `$FolderMap, `$ArticleMap, `$NetworkMap, `$RackMap" -ForegroundColor Magenta
+    Write-Host "`nMappings in session: `$CompanyMap, `$LayoutMap, `$FolderMap, `$ArticleMap, `$AssetMap, `$NetworkMap, `$RackMap" -ForegroundColor Magenta
 
 } finally {
     if ($SourceHuduApiKeySecure -is [System.Security.SecureString]) { $SourceHuduApiKeySecure.Dispose() }

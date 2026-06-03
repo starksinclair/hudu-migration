@@ -2,23 +2,26 @@
 
 PowerShell migration toolkit for moving data between **Hudu tenants** (source → target) using the [HuduAPI](https://www.powershellgallery.com/packages/HuduAPI) module (v2.4.5+).
 
-The main entry point is `company-migration.ps1`, which orchestrates companies, knowledge base content, passwords, procedures, websites, IPAM, photo galleries, rack storages, and flags. A separate script, `Confluence-Migration.ps1`, handles Confluence → Hudu (different workflow).
+The main entry point is `company-migration.ps1`, which orchestrates companies, asset layouts, knowledge base content, passwords, procedures, websites, IPAM, photo galleries, assets, rack storages, relations, and flags. A separate script, `Confluence-Migration.ps1`, handles Confluence → Hudu (different workflow).
 
 ## Overview
 
 | Step | Phase             | What happens                                                               |
 | ---- | ----------------- | -------------------------------------------------------------------------- |
-| 1    | **Companies**     | Fetched from source; created or matched in target → `CompanyMap`           |
-| 2a   | **KB folders**    | Article folders only (photo folders handled later) → `FolderMap`           |
-| 2b   | **Articles**      | Content, sharing, attachments (`public_photos` + `uploads`) → `ArticleMap` |
-| 3    | **Passwords**     | Password folders + credential records (idempotent by name/company)         |
-| 4    | **URL relinking** | Internal article links and embed paths rewritten to target URLs            |
-| 5    | **Procedures**    | Templates/runs and tasks                                                   |
-| 6    | **Websites**      | URLs, notes, monitoring and DMARC/DKIM/SPF settings                        |
-| 7    | **IPAM**          | Networks (subnets) and IP addresses → `NetworkMap`                         |
-| 8    | **Photo gallery** | Company photo folders + gallery photos (`/api/v1/photos`)                  |
-| 9    | **Racks**         | Rack storages and rack items → `RackMap`                                   |
-| 10   | **Flags**         | Flag types + flags on articles, assets, passwords, etc.                    |
+| 1    | **Companies**     | Name, type, address, phone/fax, website, ID, notes, parent link → `CompanyMap` |
+| 2    | **Asset layouts** | Layouts + field definitions (ListSelect lists mapped) → `LayoutMap`        |
+| 3a   | **KB folders**    | Article folders only (photo folders handled later) → `FolderMap`           |
+| 3b   | **Articles**      | Content, sharing, attachments (`public_photos` + `uploads`) → `ArticleMap` |
+| 4    | **Passwords**     | Password folders + credentials (description, `login_url`; not vault `url`) |
+| 5    | **URL relinking** | Internal article links and embed paths rewritten to target URLs            |
+| 6    | **Procedures**    | Templates/runs and tasks                                                   |
+| 7    | **Websites**      | URLs, notes, monitoring and DMARC/DKIM/SPF settings                        |
+| 8    | **IPAM**          | VLAN zones, VLANs, networks (subnets), and IP addresses → `NetworkMap`     |
+| 9    | **Photo gallery** | Company photo folders + gallery photos (`/api/v1/photos`)                  |
+| 10   | **Assets**        | Company assets per layout + custom fields → `AssetMap`                     |
+| 11   | **Racks**         | Rack storages and rack items (uses `AssetMap`) → `RackMap`                 |
+| 12   | **Relations**     | Links between migrated assets, articles, passwords, etc.                   |
+| 13   | **Flags**         | Flag types + flags on articles, assets, passwords, etc.                    |
 
 **References used during development:**
 
@@ -46,16 +49,22 @@ cd path\to\hudu-migration
 
 On launch, the script will:
 
-1. Prompt for source and target Hudu URLs and API keys (`SecureString`; never written to disk)
-2. Open the **company selector** — WinForms on Windows, console menu on macOS/Linux
-3. Run all migration steps in order (single company or all companies)
-4. Write a timestamped log and optional phase JSON under the log directory (default: `~/HuduMigration/logs` on Mac/Linux, `%USERPROFILE%\HuduMigration\logs` on Windows)
+1. Ask **how many Hudu instances** (`1` or `2`):
+   - **2** — normal migration (source URL/key + target URL/key)
+   - **1** — same-tenant **test mode** until a real target is available; one URL/key, and new records get a name suffix (default ` [MIG-TEST]`) via `Get-MigrationName` so creates do not hit “already exists” errors
+2. Prompt for URL(s) and API key(s) (`SecureString`; never written to disk)
+3. Open the **company selector** — WinForms on Windows, console menu on macOS/Linux
+4. Run all migration steps in order (single company or all companies)
+5. Write a timestamped log and optional phase JSON under the log directory (default: `~/HuduMigration/logs` on Mac/Linux, `%USERPROFILE%\HuduMigration\logs` on Windows)
 
 ### Optional parameters
 
 Pre-set variables before dot-sourcing:
 
 ```powershell
+# Optional: force same-instance test mode and custom suffix before dot-sourcing
+$MigrationTestNameSuffix = ' [MIG-TEST]'
+
 $SourceHuduUrl = "https://source.example.hudu.com"
 $TargetHuduUrl = "https://target.example.hudu.com"
 $SourceHuduApiKeySecure = Read-Host "Source API Key" -AsSecureString
@@ -71,6 +80,7 @@ Dot-source (`. .\company-migration.ps1`) is required so `$CompanyMap`, `$Article
 
 ## Features
 
+- **Single-instance test mode** — run against one tenant with suffixed names (`1` at startup)
 - **Single-company test mode** — migrate one company before a full production run
 - **Idempotent creates** — match existing target records by name (+ company) where possible before creating
 - **Resume-friendly checkpoints** — phase mappings saved as JSON in `$LogDir` (e.g. `companies.json`, `folders.json`, `racks.json`)
@@ -88,21 +98,24 @@ START
   ├─ Credentials + company selector (SINGLE | ALL)
   │
   ├─ 1. Companies          → CompanyMap
-  ├─ 2a. KB folders        → FolderMap
-  ├─ 2b. Articles + files  → ArticleMap
-  ├─ 3. Passwords + password folders
-  ├─ 4. Relink article HTML / embed URLs
-  ├─ 5. Procedures + tasks
-  ├─ 6. Websites
-  ├─ 7. IPAM (networks + IPs) → NetworkMap
-  ├─ 8. Company photo gallery + photo folders
-  ├─ 9. Rack storages + rack items → RackMap
-  └─ 10. Flag types + flags (uses ArticleMap, RackMap; asset flags match by name/slug/serial)
+  ├─ 2. Asset layouts      → LayoutMap (+ LayoutFieldMap)
+  ├─ 3a. KB folders        → FolderMap
+  ├─ 3b. Articles + files  → ArticleMap
+  ├─ 4. Passwords + password folders
+  ├─ 5. Relink article HTML / embed URLs
+  ├─ 6. Procedures + tasks
+  ├─ 7. Websites
+  ├─ 8. IPAM (VLAN zones, VLANs, networks, IPs) → NetworkMap
+  ├─ 9. Company photo gallery + photo folders
+  ├─ 10. Assets            → AssetMap
+  ├─ 11. Rack storages + rack items → RackMap
+  ├─ 12. Relations (Article, Asset, Password, Company, Website, Rack, Network)
+  └─ 13. Flag types + flags (uses ArticleMap, AssetMap, RackMap)
   │
   SUMMARY + dispose API keys
 ```
 
-Session variables after a successful run include `$CompanyMap`, `$FolderMap`, `$ArticleMap`, `$NetworkMap`, and `$RackMap`.
+Session variables after a successful run include `$CompanyMap`, `$LayoutMap`, `$FolderMap`, `$ArticleMap`, `$AssetMap`, `$NetworkMap`, and `$RackMap`.
 
 ## What is not migrated
 
@@ -110,17 +123,20 @@ These are **out of scope** for `company-migration.ps1` today (details in [Limita
 
 | Item                            | Notes                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Flexible assets (bulk)**      | Layouts and asset records are not created; rack items and **asset flags** only work when a target asset already matches by name, slug, or serial |
 | **Contacts / locations**        | Not implemented; IPAM `location_id` may be dangling on target                                                                                    |
-| **Relations**                   | Asset↔password / asset↔asset links are not recreated                                                                                           |
+| **Some relation endpoints**     | Procedure, IpAddress, Vlan, and similar types are skipped until those objects are mapped                                                         |
 | **Configurations / Magic Dash** | Not implemented                                                                                                                                  |
+| **Asset photos / comments**     | Layout flags are set; per-asset photos and comments are not bulk-migrated                                                                        |
 
-## Flags and asset flags
+## Flags and assets
 
+- **Asset layouts** are created (or matched by name) before assets; **ListSelect** fields use a source→target list map.
+- **Assets** are created per company with `custom_fields` keyed by layout field labels (snake_case). **AssetTag** field values and layout **linkable_id** fixes run in a second pass after layouts exist.
+- **Rack items** prefer `AssetMap` (migrated IDs), then fall back to name match within the company.
+- **Relations** remap endpoints when both sides resolve (`Asset`, `Article`, `AssetPassword`, `Company`, `Website`, `RackStorage`, `Network`).
 - **Flag types** are matched on the target by name + color, or created if missing.
-- **Flag instances** are attached to migrated objects using ID maps (`Article`, `Company`, `RackStorage`, etc.) or lookups (passwords, websites).
-- **Re-runs** skip duplicates via a target-side index (`FlagsDuplicatesSkipped` in the summary).
-- **Asset flags** require a matching asset on the target in the same company; the script does not create assets. Check the log for `Asset map for company X -> Y: N matched`.
+- **Flag instances** use `AssetMap` for assets, plus maps/lookups for articles, passwords, websites, racks, and companies.
+- **Re-runs** skip duplicate flags via a target-side index (`FlagsDuplicatesSkipped` in the summary).
 
 ## Repository layout
 
@@ -135,6 +151,7 @@ hudu-migration/
 │   ├── Helpers.ps1           # Logging, tenant switch, file upload, maps
 │   ├── CompanySelector.ps1
 │   ├── Migrate-Companies.ps1
+│   ├── Migrate-AssetLayouts.ps1
 │   ├── Migrate-Folders.ps1
 │   ├── Migrate-Articles.ps1
 │   ├── Migrate-Passwords.ps1
@@ -143,7 +160,9 @@ hudu-migration/
 │   ├── Migrate-Websites.ps1
 │   ├── Migrate-IPAM.ps1
 │   ├── Migrate-CompanyPhotos.ps1
+│   ├── Migrate-Assets.ps1
 │   ├── Migrate-Racks.ps1
+│   ├── Migrate-Relations.ps1
 │   └── Migrate-Flags.ps1
 └── helpers/                  # Confluence helpers (not used by company-migration)
 ```
@@ -159,7 +178,9 @@ Use a **small test company** (roughly 10–50 articles) before a full run:
 - [ ] Click internal article links — should point to target URLs
 - [ ] Confirm websites and IPAM if used in that company
 - [ ] Check company photo gallery and rack layout if applicable
-- [ ] Review flags on articles; for asset flags, confirm matching assets exist on target
+- [ ] Verify asset layouts, sample assets, and custom field values
+- [ ] Spot-check relations (asset↔password, asset↔article) if used
+- [ ] Review flags on articles and migrated assets
 - [ ] Review log file, `skipped_files.csv` (if any), and phase JSON in `$LogDir`
 - [ ] Re-run once to confirm duplicate flags are skipped (`FlagsDuplicatesSkipped`)
 - [ ] Schedule **all-companies** migration after sign-off
@@ -172,9 +193,11 @@ Track run-specific findings in your team tracker. Standing limitations and worka
 
 1. `company-migration.ps1` — step order, stats (`IDictionary` binding), security
 2. `steps/Migrate-Articles.ps1` — `public_photos` vs `uploads` routing
-3. `steps/Migrate-Racks.ps1` — asset-linked items when no name match
-4. `steps/Migrate-Flags.ps1` — dedupe keys and asset matching
-5. `steps/Migrate-Passwords.ps1` — folder security and single-company filter
+3. `steps/Migrate-Assets.ps1` / `Migrate-AssetLayouts.ps1` — field types, AssetTag second pass
+4. `steps/Migrate-Racks.ps1` — `AssetMap` vs name fallback
+5. `steps/Migrate-Relations.ps1` — endpoint types and dedupe
+6. `steps/Migrate-Flags.ps1` — dedupe keys and `AssetMap`
+7. `steps/Migrate-Passwords.ps1` — folder security and single-company filter
 
 ## References
 
