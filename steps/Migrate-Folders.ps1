@@ -46,6 +46,11 @@ function Invoke-FolderMigration {
                 continue
             }
 
+            if (Test-IsAssetLayoutSidebarFolder $folder) {
+                $pending.RemoveAt($i)
+                continue
+            }
+
             $targetCompanyId = $null
             if ($folder.company_id -and $folder.company_id -ne 0) {
                 $targetCompanyId = $CompanyMap[[string]$folder.company_id]

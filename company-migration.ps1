@@ -7,15 +7,24 @@
 #
 # Usage:
 #   . .\company-migration.ps1
+#   . .\company-migration.ps1 -SkipAssetMigration
+#
+# Skip asset layouts, company assets, and relations (KB/passwords/racks/etc. still run):
+#   . .\company-migration.ps1 -SkipAssetMigration
 #
 # The script will:
 #   1. Prompt for source and target credentials
-#   2. Company selector: WinForms GUI on Windows, console menu on macOS/Linux
-#   3. Let user choose: migrate ONE company (testing) or ALL companies (production)
-#   4. Run each migration step in order
+#   2. Ask whether to skip asset layouts, assets, and relations (unless -SkipAssetMigration)
+#   3. Company selector: WinForms GUI on Windows, console menu on macOS/Linux
+#   4. Let user choose: migrate ONE company (testing) or ALL companies (production)
+#   5. Run each migration step in order
 # ============================================================================
 
 #Requires -Version 7.0
+
+param(
+    [switch]$SkipAssetMigration
+)
 
 # ============================================================================
 # MODULE BOOTSTRAP
@@ -102,6 +111,17 @@ if ($SourceHuduApiKeySecure -isnot [System.Security.SecureString] -or
     if ($raw -match '^\d+$') { [int]$raw } else { 100 }
 }
 
+if (-not $PSBoundParameters.ContainsKey('SkipAssetMigration')) {
+    do {
+        $skipInput = Read-Host "Skip asset layouts, assets, and relations? (y/N)"
+        if ([string]::IsNullOrWhiteSpace($skipInput)) { $skipInput = 'n' }
+    } while ($skipInput -notmatch '^(?i)(y|yes|n|no)$')
+    $SkipAssetMigration = $skipInput -match '^(?i)(y|yes)$'
+    if ($SkipAssetMigration) {
+        Write-Host "Asset layouts, assets, and relations will be skipped." -ForegroundColor Yellow
+    }
+}
+
 $MigrationRoot = Join-Path $HOME "HuduMigration"
 $TempPath = $TempPath ?? (Join-Path $MigrationRoot "downloads")
 $LogDir   = $LogDir   ?? (Join-Path $MigrationRoot "logs")
@@ -126,6 +146,9 @@ try {
     Write-Log "Instances: $script:MigrationInstanceCount $(if ($script:MigrationInstanceCount -eq 1) { "(same-tenant test; suffix '$script:MigrationTestNameSuffix')" } else { '(source → target)' })"
     Write-Log "Source : $SourceHuduUrl"
     Write-Log "Target : $TargetHuduUrl"
+    if ($SkipAssetMigration) {
+        Write-Log "SkipAssetMigration: asset layouts, assets, and relations will NOT be created." "WARN"
+    }
 
     # Pre-flight
     Write-Log "--- Pre-flight: verifying connectivity ---"
@@ -208,11 +231,21 @@ try {
         -MigrationMode      $migrationMode `
         -SelectedCompanyId  $selectedCompanyId
 
-    $layoutMigration = Invoke-AssetLayoutMigration `
-        -Stats              $Stats `
-        -MigrationMode      $migrationMode `
-        -SelectedCompanyId  $selectedCompanyId
-    $LayoutMap = $layoutMigration.LayoutMap
+    $LayoutMap = @{}
+    $layoutMigration = @{
+        LayoutMap      = @{}
+        LayoutFieldMap = @{}
+        ListMap        = @{}
+    }
+    if ($SkipAssetMigration) {
+        Write-Log "========== SKIPPED: ASSET LAYOUTS (SkipAssetMigration) ==========" "WARN"
+    } else {
+        $layoutMigration = Invoke-AssetLayoutMigration `
+            -Stats              $Stats `
+            -MigrationMode      $migrationMode `
+            -SelectedCompanyId  $selectedCompanyId
+        $LayoutMap = $layoutMigration.LayoutMap
+    }
 
     $FolderMap = Invoke-FolderMigration `
         -CompanyMap         $CompanyMap `
@@ -271,13 +304,18 @@ try {
         -TempPath          $TempPath `
         -MaxFileSizeMB     $MaxFileSizeMB
 
-    $AssetMap = Invoke-AssetMigration `
-        -CompanyMap        $CompanyMap `
-        -LayoutMap         $LayoutMap `
-        -LayoutFieldMap    $layoutMigration.LayoutFieldMap `
-        -Stats             $Stats `
-        -MigrationMode     $migrationMode `
-        -SelectedCompanyId $selectedCompanyId
+    $AssetMap = @{}
+    if ($SkipAssetMigration) {
+        Write-Log "========== SKIPPED: ASSETS (SkipAssetMigration) ==========" "WARN"
+    } else {
+        $AssetMap = Invoke-AssetMigration `
+            -CompanyMap        $CompanyMap `
+            -LayoutMap         $LayoutMap `
+            -LayoutFieldMap    $layoutMigration.LayoutFieldMap `
+            -Stats             $Stats `
+            -MigrationMode     $migrationMode `
+            -SelectedCompanyId $selectedCompanyId
+    }
 
     $RackMap = Invoke-RackMigration `
         -CompanyMap        $CompanyMap `
@@ -286,15 +324,19 @@ try {
         -MigrationMode     $migrationMode `
         -SelectedCompanyId $selectedCompanyId
 
-    Invoke-RelationMigration `
-        -CompanyMap        $CompanyMap `
-        -ArticleMap        $ArticleMap `
-        -AssetMap          $AssetMap `
-        -RackMap           $RackMap `
-        -NetworkMap        $NetworkMap `
-        -Stats             $Stats `
-        -MigrationMode     $migrationMode `
-        -SelectedCompanyId $selectedCompanyId
+    if ($SkipAssetMigration) {
+        Write-Log "========== SKIPPED: RELATIONS (SkipAssetMigration) ==========" "WARN"
+    } else {
+        Invoke-RelationMigration `
+            -CompanyMap        $CompanyMap `
+            -ArticleMap        $ArticleMap `
+            -AssetMap          $AssetMap `
+            -RackMap           $RackMap `
+            -NetworkMap        $NetworkMap `
+            -Stats             $Stats `
+            -MigrationMode     $migrationMode `
+            -SelectedCompanyId $selectedCompanyId
+    }
 
     Invoke-FlagMigration `
         -CompanyMap        $CompanyMap `
@@ -315,7 +357,13 @@ try {
     Write-Log "=========================================="
     Write-Log "Mode       : $migrationMode"
     Write-Log "Companies  - Created: $($Stats.CompaniesCreated) | Matched: $($Stats.CompaniesSkipped) | Failed: $($Stats.CompaniesFailed)"
-    Write-Log "Layouts    - Created: $($Stats.AssetLayoutsCreated) | Skipped: $($Stats.AssetLayoutsSkipped) | Failed: $($Stats.AssetLayoutsFailed)"
+    if ($SkipAssetMigration) {
+        Write-Log "Layouts    - SKIPPED (SkipAssetMigration)"
+        Write-Log "Assets     - SKIPPED (SkipAssetMigration)"
+        Write-Log "Relations  - SKIPPED (SkipAssetMigration)"
+    } else {
+        Write-Log "Layouts    - Created: $($Stats.AssetLayoutsCreated) | Skipped: $($Stats.AssetLayoutsSkipped) | Failed: $($Stats.AssetLayoutsFailed)"
+    }
     Write-Log "Folders    - Created: $($Stats.FoldersCreated) | Failed: $($Stats.FoldersFailed)"
     Write-Log "Articles   - Created: $($Stats.ArticlesCreated) | Matched: $($Stats.ArticlesSkipped) | Failed: $($Stats.ArticlesFailed)"
     Write-Log "Passwords  - Created: $($Stats.PasswordsCreated) | Failed: $($Stats.PasswordsFailed)"
@@ -332,8 +380,10 @@ try {
     Write-Log "Photos     - Uploaded: $($Stats.PhotosUploaded) | Failed: $($Stats.PhotosFailed)"
     Write-Log "Racks      - Created: $($Stats.RacksCreated) | Skipped: $($Stats.RacksSkipped) | Failed: $($Stats.RacksFailed)"
     Write-Log "Rack items - Created: $($Stats.RackItemsCreated) | Skipped: $($Stats.RackItemsSkipped) | Failed: $($Stats.RackItemsFailed)"
-    Write-Log "Assets     - Created: $($Stats.AssetsCreated) | Skipped: $($Stats.AssetsSkipped) | Failed: $($Stats.AssetsFailed)"
-    Write-Log "Relations  - Created: $($Stats.RelationsCreated) | Skipped: $($Stats.RelationsSkipped) | Failed: $($Stats.RelationsFailed)"
+    if (-not $SkipAssetMigration) {
+        Write-Log "Assets     - Created: $($Stats.AssetsCreated) | Skipped: $($Stats.AssetsSkipped) | Failed: $($Stats.AssetsFailed)"
+        Write-Log "Relations  - Created: $($Stats.RelationsCreated) | Skipped: $($Stats.RelationsSkipped) | Failed: $($Stats.RelationsFailed)"
+    }
     Write-Log "Flag types - Created: $($Stats.FlagTypesCreated) | Matched: $($Stats.FlagTypesSkipped) | Failed: $($Stats.FlagTypesFailed)"
     Write-Log "Flags      - Created: $($Stats.FlagsCreated) | Skipped: $($Stats.FlagsSkipped) | Duplicates: $($Stats.FlagsDuplicatesSkipped) | Failed: $($Stats.FlagsFailed)"
     Write-Log "Log        : $LogFile"

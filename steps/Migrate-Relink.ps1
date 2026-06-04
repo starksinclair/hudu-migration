@@ -13,10 +13,15 @@ function Invoke-RelinkArticles {
     foreach ($entry in $ArticleMap.Values) {
         Use-SourceHudu
         try {
-            $raw        = Get-HuduArticles -Id $entry.SourceId
-            $srcArticle = $raw.article ?? $raw
+            $srcOrStatus = Get-HuduArticleByIdSafe -Id $entry.SourceId
+            if ($srcOrStatus -eq 'CompanyScopeDenied') {
+                Write-Log "Source article $($entry.SourceId): API key cannot access this article (permissions scoped to company) — skipping relink." "WARN"
+                $failed++
+                continue
+            }
+            $srcArticle = $srcOrStatus
         } catch {
-            Write-Log "Could not fetch source article ID $($entry.SourceId): $_" "ERROR"
+            Write-Log "Could not fetch source article ID $($entry.SourceId): $(Get-HuduApiErrorSummary $_)" "ERROR"
             $failed++
             continue
         }

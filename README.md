@@ -74,12 +74,16 @@ $TempPath = "C:\Temp\HuduMigration\downloads"
 $LogDir   = "C:\Temp\HuduMigration\logs"
 
 . .\company-migration.ps1
+
+# KB-only (no asset layouts, assets, or relations):
+. .\company-migration.ps1 -SkipAssetMigration
 ```
 
-Dot-source (`. .\company-migration.ps1`) is required so `$CompanyMap`, `$ArticleMap`, stats, and selector state persist in your session.
+Dot-source (`. .\company-migration.ps1`) is required so `$CompanyMap`, `$ArticleMap`, stats, and selector state persist in your session. At startup you are asked whether to skip asset layouts, assets, and relations (default **no**). Pass `-SkipAssetMigration` on the dot-source line to skip the prompt and skip those steps.
 
 ## Features
 
+- **SkipAssetMigration** — optional switch to skip asset layouts, assets, and relations (other steps unchanged)
 - **Single-instance test mode** — run against one tenant with suffixed names (`1` at startup)
 - **Single-company test mode** — migrate one company before a full production run
 - **Idempotent creates** — match existing target records by name (+ company) where possible before creating

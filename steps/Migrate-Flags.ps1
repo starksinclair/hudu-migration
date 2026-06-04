@@ -60,11 +60,17 @@ function Get-SourceAssetCompanyId {
     try {
         Use-SourceHudu
         $asset = Get-HuduSingleAsset -AssetId $AssetId
-        if ($asset -and $asset.PSObject.Properties['company_id'] -and $asset.company_id) {
+        if ($asset -eq 'CompanyScopeDenied') {
+            $deniedKey = "asset:denied:$AssetId"
+            if (-not $Cache.ContainsKey($deniedKey)) {
+                Write-Log "Source asset $AssetId : API key cannot access this asset (permissions scoped to company) — skipping." "WARN"
+                $Cache[$deniedKey] = $true
+            }
+        } elseif ($asset -and $asset.PSObject.Properties['company_id'] -and $asset.company_id) {
             $companyId = [int]$asset.company_id
         }
     } catch {
-        Write-Log "Could not load source asset $AssetId for flag mapping: $_" "WARN"
+        Write-Log "Could not load source asset $AssetId for flag mapping: $(Get-HuduApiErrorSummary $_)" "WARN"
     }
 
     $Cache[$key] = $companyId

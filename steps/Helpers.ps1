@@ -10,6 +10,20 @@
 
 # When MigrationInstanceCount is 1, source and target are the same Hudu tenant.
 # New records use a suffix on the name so creates do not collide with existing rows.
+function Get-MigrationAssetDisplayName {
+    param([object]$Asset)
+
+    if (-not $Asset -or -not $Asset.PSObject.Properties['name'] -or $null -eq $Asset.name) {
+        return $null
+    }
+    if ($Asset.name -is [string]) {
+        $n = $Asset.name.Trim()
+        if ($n -and $n -notmatch '^System\.Collections\.') { return $n }
+        return $null
+    }
+    return $null
+}
+
 function Get-MigrationName {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) { return $Name }
@@ -166,9 +180,106 @@ function Invoke-HuduJsonApi {
     try {
         return Invoke-RestMethod @params
     } catch {
-        $detail = $_.ErrorDetails.Message
-        if (-not $detail) { $detail = $_.Exception.Message }
-        throw "Hudu API $Method $Resource failed: $detail"
+        $summary = Get-HuduApiErrorSummary -ErrorRecord $_
+        throw "Hudu API $Method $Resource failed: $summary"
+    }
+}
+
+function Get-HuduApiErrorText {
+    param([object]$ErrorRecord)
+
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            return [string]$ErrorRecord.ErrorDetails.Message
+        }
+        if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Message) {
+            return [string]$ErrorRecord.Exception.Message
+        }
+    }
+    return [string]$ErrorRecord
+}
+
+function Test-HuduApiHtmlErrorBody {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $head = $Text.Trim()
+    if ($head.Length -gt 800) { $head = $head.Substring(0, 800) }
+    return $head -match '(?is)<!DOCTYPE\s+html|<html\b|<body\b|</html>|<svg\b'
+}
+
+function Get-HuduApiHttpStatusCode {
+    param([object]$ErrorRecord)
+
+    if ($ErrorRecord -isnot [System.Management.Automation.ErrorRecord]) { return $null }
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    } catch { }
+    return $null
+}
+
+function Get-HuduApiErrorSummary {
+    param([object]$ErrorRecord)
+
+    $statusCode = Get-HuduApiHttpStatusCode -ErrorRecord $ErrorRecord
+    $text       = Get-HuduApiErrorText -ErrorRecord $ErrorRecord
+
+    if (Test-HuduCompanyScopedPermissionError $text) {
+        return 'permissions scoped to company (API key cannot access this resource)'
+    }
+
+    if ($text -match '"error"\s*:\s*"([^"]+)"') {
+        return [string]$Matches[1]
+    }
+
+    if ($statusCode -eq 404 -or $text -match '(?i)\b404\b|not found') {
+        return 'HTTP 404 Not Found'
+    }
+
+    if (Test-HuduApiHtmlErrorBody $text) {
+        if ($statusCode) {
+            return "HTTP $statusCode (HTML error page returned instead of JSON)"
+        }
+        return 'HTTP error (HTML error page returned instead of JSON)'
+    }
+
+    $oneLine = ($text -replace '\s+', ' ').Trim()
+    if ($oneLine.Length -gt 240) {
+        $oneLine = $oneLine.Substring(0, 240) + '...'
+    }
+    if ($statusCode -and $oneLine) { return "HTTP $statusCode — $oneLine" }
+    if ($statusCode)               { return "HTTP $statusCode" }
+    if ($oneLine)                  { return $oneLine }
+    return 'unknown API error'
+}
+
+# Company-scoped API keys cannot read resources outside allowed companies (no retry).
+function Test-HuduCompanyScopedPermissionError {
+    param([object]$ErrorRecord)
+
+    return (Get-HuduApiErrorText -ErrorRecord $ErrorRecord) -match 'Permissions scoped to company'
+}
+
+function Test-HuduApiNotFoundError {
+    param([object]$ErrorRecord)
+
+    $summary = Get-HuduApiErrorSummary -ErrorRecord $ErrorRecord
+    return $summary -match '(?i)404|not found'
+}
+
+function Get-HuduArticleByIdSafe {
+    param([int]$Id)
+
+    try {
+        $raw = Invoke-HuduJsonApi -Method GET -Resource "/api/v1/articles/$Id"
+        return $raw.article ?? $raw
+    } catch {
+        if (Test-HuduCompanyScopedPermissionError $_) {
+            return 'CompanyScopeDenied'
+        }
+        throw
     }
 }
 
@@ -357,6 +468,149 @@ function Test-IsPhotoFolder {
     return $false
 }
 
+function Test-IsAssetLayoutSidebarFolder {
+    param([object]$Folder)
+
+    if (-not $Folder) { return $false }
+    if (Test-IsPhotoFolder $Folder) { return $false }
+
+    if ($script:MigrationAssetLayoutSidebarFolderIds -and $Folder.id) {
+        if ($script:MigrationAssetLayoutSidebarFolderIds.ContainsKey([string]$Folder.id)) {
+            return $true
+        }
+    }
+
+    foreach ($prop in @('folder_type', 'type')) {
+        if ($Folder.PSObject.Properties[$prop] -and $Folder.$prop) {
+            return [string]$Folder.$prop -match '^(?i)(asset[_-]?layout|sidebar|layout)$'
+        }
+    }
+    return $false
+}
+
+function Get-AssetLayoutSidebarFolderLookupKey {
+    param([string]$Name, [object]$ParentFolderId)
+
+    $p = if ($ParentFolderId) { [string]$ParentFolderId } else { '0' }
+    $n = (Get-MigrationName -Name $Name).Trim().ToLowerInvariant()
+    return ('sidebar|{0}|{1}' -f $n, $p)
+}
+
+function Get-MigrationAssetLayoutSidebarFolderId {
+    param([object]$Layout)
+
+    if (-not $Layout) { return $null }
+    if ($Layout.PSObject.Properties['sidebar_folder_id'] -and $Layout.sidebar_folder_id) {
+        $id = [int]$Layout.sidebar_folder_id
+        if ($id -gt 0) { return $id }
+    }
+    return $null
+}
+
+function Get-MigrationAssetLayoutSidebarFolderClosure {
+    param([int[]]$RootFolderIds)
+
+    $byId = @{}
+    $pending = [System.Collections.Generic.Queue[int]]::new()
+    foreach ($id in $RootFolderIds) {
+        if ($id -gt 0) { $pending.Enqueue($id) }
+    }
+
+    while ($pending.Count -gt 0) {
+        $folderId = $pending.Dequeue()
+        $key = [string]$folderId
+        if ($byId.ContainsKey($key)) { continue }
+
+        try {
+            Use-SourceHudu
+            $folder = Get-HuduFolders -Id $folderId
+            if (-not $folder) { continue }
+            $byId[$key] = $folder
+            $parentId = Get-FolderParentFolderId $folder
+            if ($parentId -and -not $byId.ContainsKey([string]$parentId)) {
+                $pending.Enqueue($parentId)
+            }
+        } catch {
+            Write-Log "Could not load asset layout sidebar folder ID $folderId : $_" "WARN"
+        }
+    }
+
+    return $byId.Values
+}
+
+function New-MigrationAssetLayoutSidebarFolderApi {
+    param(
+        [string]$Name,
+        [int]$ParentFolderId = 0,
+        [object]$SourceFolder = $null
+    )
+
+    $folderPayload = @{ name = $Name }
+    if ($ParentFolderId -gt 0) { $folderPayload['parent_folder_id'] = $ParentFolderId }
+
+    if ($SourceFolder) {
+        foreach ($prop in @('folder_type', 'type', 'description')) {
+            if ($SourceFolder.PSObject.Properties[$prop] -and $SourceFolder.$prop) {
+                if ($prop -eq 'description') {
+                    $folderPayload['description'] = [string]$SourceFolder.$prop
+                } else {
+                    $folderPayload['folder_type'] = [string]$SourceFolder.$prop
+                }
+            }
+        }
+    }
+
+    $attempts = [System.Collections.Generic.List[hashtable]]::new()
+    $null = $attempts.Add(@{ folder = $folderPayload })
+
+    if (-not $folderPayload.ContainsKey('folder_type')) {
+        foreach ($guess in @('asset_layout', 'sidebar', 'layout')) {
+            $copy = @{} + $folderPayload
+            $copy['folder_type'] = $guess
+            $null = $attempts.Add(@{ folder = $copy })
+        }
+    }
+
+    $lastError = $null
+    foreach ($body in $attempts) {
+        try {
+            $response = Invoke-HuduJsonApi -Method POST -Resource '/api/v1/folders' -Body $body
+            $created = $response.folder ?? $response
+            if ($created -and $created.id) { return $created }
+        } catch {
+            $lastError = $_
+        }
+    }
+
+    if ($lastError) { throw $lastError }
+    throw 'API returned no folder id for asset layout sidebar folder'
+}
+
+function Set-MigrationAssetLayoutSidebarFolder {
+    param(
+        [int]$TargetLayoutId,
+        [int]$TargetSidebarFolderId
+    )
+
+    if ($TargetSidebarFolderId -le 0) { return $false }
+
+    try {
+        Use-TargetHudu
+        $raw = Get-HuduAssetLayouts -LayoutId $TargetLayoutId
+        $layout = if ($raw.PSObject.Properties['asset_layout'] -and $raw.asset_layout) { $raw.asset_layout } else { $raw }
+        if (-not $layout) { return $false }
+
+        $layout.sidebar_folder_id = $TargetSidebarFolderId
+        Invoke-HuduJsonApi -Method PUT -Resource "/api/v1/asset_layouts/$TargetLayoutId" -Body @{
+            asset_layout = $layout
+        } | Out-Null
+        return $true
+    } catch {
+        Write-Log "Could not set sidebar folder on asset layout target ID $TargetLayoutId : $_" "WARN"
+        return $false
+    }
+}
+
 # ---- Folder lookup helpers --------------------------------------------------
 
 function Get-FolderCompanyId {
@@ -497,7 +751,18 @@ function Add-PasswordLookupEntry {
 function Get-HuduSingleAsset {
     param([int]$AssetId)
 
-    $response = Get-HuduAssets -Id $AssetId
+    try {
+        $response = Invoke-HuduJsonApi -Method GET -Resource "/api/v1/assets/$AssetId"
+    } catch {
+        if (Test-HuduCompanyScopedPermissionError $_) {
+            return 'CompanyScopeDenied'
+        }
+        if (Test-HuduApiNotFoundError $_) {
+            return $null
+        }
+        throw
+    }
+
     if ($null -eq $response) { return $null }
 
     if ($response.PSObject.Properties['asset'] -and $response.asset) {
@@ -667,6 +932,80 @@ function Get-MigrationListMap {
     return $map
 }
 
+function Get-MigrationTargetListOptions {
+    param(
+        [int]$ListId,
+        [hashtable]$Cache
+    )
+
+    if ($ListId -le 0) { return @() }
+    if ($Cache.ContainsKey($ListId)) { return $Cache[$ListId] }
+
+    $options = [System.Collections.Generic.List[string]]::new()
+    try {
+        Use-TargetHudu
+        $raw = Get-HuduLists -Id $ListId
+        $list = $raw.list ?? $raw
+        if ($list -and $list.PSObject.Properties['items'] -and $list.items) {
+            foreach ($item in @($list.items)) {
+                if ($item -is [string] -and $item) {
+                    $null = $options.Add($item)
+                } elseif ($item.PSObject.Properties['name'] -and $item.name) {
+                    $null = $options.Add([string]$item.name)
+                } elseif ($item.PSObject.Properties['label'] -and $item.label) {
+                    $null = $options.Add([string]$item.label)
+                }
+            }
+        }
+    } catch {
+        Write-Log "Could not load target list $ListId options: $_" "WARN"
+    }
+
+    $arr = @($options.ToArray())
+    $Cache[$ListId] = $arr
+    return $arr
+}
+
+function Resolve-MigrationListSelectValue {
+    param(
+        [string]$SourceValue,
+        [string[]]$ValidOptions
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SourceValue) -or -not $ValidOptions -or $ValidOptions.Count -eq 0) {
+        return $null
+    }
+
+    $src = $SourceValue.Trim()
+    foreach ($opt in $ValidOptions) {
+        if ($opt -eq $src) { return $opt }
+    }
+    foreach ($opt in $ValidOptions) {
+        if ($opt.Equals($src, [System.StringComparison]::OrdinalIgnoreCase)) { return $opt }
+    }
+
+    $aliases = @{
+        'SMB'                                      = 'SMB / CIFS'
+        'Smartphone'                               = 'Phone'
+        'SSL VPN'                                  = 'Client VPN'
+        'Hyper-V'                                  = 'Microsoft Hyper-V'
+        'Microsoft Defender for Endpoint (P2)'     = 'Microsoft Defender'
+        'Cloud Access Control'                     = 'Other'
+    }
+    if ($aliases.ContainsKey($src) -and ($ValidOptions -contains $aliases[$src])) {
+        return $aliases[$src]
+    }
+
+    foreach ($opt in $ValidOptions) {
+        if ($opt -like "*$src*" -or $src -like "*$($opt.Split('/')[0].Trim())*") {
+            return $opt
+        }
+    }
+
+    if ($ValidOptions -contains 'Other') { return 'Other' }
+    return $null
+}
+
 function ConvertTo-MigrationAssetLayoutField {
     param(
         [object]$Field,
@@ -707,7 +1046,8 @@ function ConvertTo-MigrationAssetFieldValues {
     param(
         [object]$SourceAsset,
         [object]$TargetLayoutDetail,
-        [hashtable]$AssetMap = @{}
+        [hashtable]$AssetMap = @{},
+        [hashtable]$ListOptionsCache = @{}
     )
 
     $values = @{}
@@ -750,11 +1090,32 @@ function ConvertTo-MigrationAssetFieldValues {
         }
 
         if ($fieldType -eq 'ListSelect') {
-            if ($sf.value -is [System.Array]) {
-                $values[$key] = @($sf.value | ForEach-Object { [string]$_ })
-            } else {
-                $values[$key] = @([string]$sf.value)
+            $listId = 0
+            if ($targetField.PSObject.Properties['list_id'] -and $targetField.list_id) {
+                $listId = [int]$targetField.list_id
             }
+            $validOptions = if ($listId -gt 0) {
+                Get-MigrationTargetListOptions -ListId $listId -Cache $ListOptionsCache
+            } else {
+                @()
+            }
+
+            $rawValues = if ($sf.value -is [System.Array]) {
+                @($sf.value | ForEach-Object { [string]$_ })
+            } else {
+                @([string]$sf.value)
+            }
+
+            $mapped = [System.Collections.Generic.List[string]]::new()
+            foreach ($rv in $rawValues) {
+                $resolved = Resolve-MigrationListSelectValue -SourceValue $rv -ValidOptions $validOptions
+                if ($resolved) { $null = $mapped.Add($resolved) }
+                elseif ($validOptions.Count -eq 0) { $null = $mapped.Add($rv) }
+                else {
+                    Write-Log "ListSelect '$label': dropped value '$rv' (not in target list options)." "WARN"
+                }
+            }
+            if ($mapped.Count -gt 0) { $values[$key] = @($mapped.ToArray()) }
             continue
         }
 
@@ -871,8 +1232,17 @@ function Resolve-MigrationArticleTargetId {
     $targetId = $null
     try {
         Use-SourceHudu
-        $raw = Get-HuduArticles -Id $SourceArticleId
-        $src = $raw.article ?? $raw
+        $srcOrStatus = Get-HuduArticleByIdSafe -Id $SourceArticleId
+        if ($srcOrStatus -eq 'CompanyScopeDenied') {
+            $deniedKey = "article:denied:$SourceArticleId"
+            if (-not $Cache.ContainsKey($deniedKey)) {
+                Write-Log "Source article $SourceArticleId : API key cannot access this article (permissions scoped to company) — skipping." "WARN"
+                $Cache[$deniedKey] = $true
+            }
+            $Cache[$cacheKey] = $null
+            return $null
+        }
+        $src = $srcOrStatus
         if ($src -and $src.name) {
             foreach ($mapped in $ArticleMap.Values) {
                 if ($mapped.Name -eq $src.name) {
@@ -910,7 +1280,7 @@ function Resolve-MigrationArticleTargetId {
             }
         }
     } catch {
-        Write-Log "Could not resolve article flag target for source article $SourceArticleId : $_" "WARN"
+        Write-Log "Could not resolve article flag target for source article $SourceArticleId : $(Get-HuduApiErrorSummary $_)" "WARN"
     }
 
     $Cache[$cacheKey] = $targetId

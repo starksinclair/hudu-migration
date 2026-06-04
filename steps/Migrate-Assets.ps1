@@ -22,6 +22,7 @@ function Invoke-AssetMigration {
     }
 
     $targetLayoutCache = @{}
+    $listOptionsCache  = @{}
 
     foreach ($srcCompanyKey in @($CompanyMap.Keys)) {
         $sourceCompanyId = [int]$srcCompanyKey
@@ -52,7 +53,13 @@ function Invoke-AssetMigration {
             }
 
             $targetLayoutId = [int]$LayoutMap[[string]$asset.asset_layout_id]
-            $targetName = Get-MigrationName -Name $asset.name
+            $displayName = Get-MigrationAssetDisplayName -Asset $asset
+            if (-not $displayName) {
+                Write-Log "Skipping asset source $($asset.id): missing or invalid name." "WARN"
+                $Stats.AssetsSkipped++
+                continue
+            }
+            $targetName = Get-MigrationName -Name $displayName
 
             $existing = Find-TargetAssetMatch -SourceAsset $asset -TargetAssets $targetAssets
             if ($existing) {
@@ -71,7 +78,8 @@ function Invoke-AssetMigration {
                 $fieldValues = ConvertTo-MigrationAssetFieldValues `
                     -SourceAsset $asset `
                     -TargetLayoutDetail $targetLayoutDetail `
-                    -AssetMap $assetMap
+                    -AssetMap $assetMap `
+                    -ListOptionsCache $listOptionsCache
 
                 Use-TargetHudu
                 $params = @{
@@ -125,7 +133,8 @@ function Invoke-AssetMigration {
             $fieldValues = ConvertTo-MigrationAssetFieldValues `
                 -SourceAsset $asset `
                 -TargetLayoutDetail $targetLayoutCache[[string]$targetLayoutId] `
-                -AssetMap $assetMap
+                -AssetMap $assetMap `
+                -ListOptionsCache $listOptionsCache
 
             $hasAssetTags = $false
             foreach ($k in $fieldValues.Keys) {

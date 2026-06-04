@@ -109,13 +109,22 @@ Phase mapping is saved to `logs/racks.json` (source rack id → target rack id) 
 
 **Asset layouts are tenant-wide**, not per company. The same layout definitions apply to every company; company pages show **assets** (records) grouped under whichever layouts are **active** for the instance.
 
+### Empty target vs same-tenant test mode
+
+| Scenario | What you see on the company dashboard |
+| -------- | ------------------------------------- |
+| **Fresh target tenant** (no pre-existing layouts) | Only layouts created by migration (with `active: true`). No duplicate names; sidebar matches source structure. |
+| **Same-tenant test mode** (`MigrationInstanceCount = 1`) | **Both** original layouts (e.g. `Computer Assets`) **and** suffixed copies (`Computer Assets [MIG-TEST]`). Open the **migrated company** (`ExampleCo [MIG-TEST]`), not the original company. Assets live under the suffixed layouts. |
+
+Production **source → empty target** migration does not create this doubling — your understanding is correct.
+
 **Asset layouts** run after companies. Each layout is created with `New-HuduAssetLayout` (or matched by suffixed name on the target). Fields are copied with types supported by `ConvertTo-MigrationAssetLayoutField` (`Text`, `RichText`, `Number`, `Checkbox`, `Date`, `ListSelect`, `AssetTag`, etc.).
 
 | Topic | Limitation |
 | ----- | ---------- |
 | **Active flag** | Layouts created via API default to **inactive** until activated. The migration calls `Set-HuduAssetLayout -Active $true` when the source layout is active (most are). Inactive layouts do not appear in company sidebars. In **single-instance test mode**, you will see both original layouts and `[MIG-TEST]` layouts if both are active — open the migrated company and look for suffixed layout names. |
-| **Admin folders** | `sidebar_folder_id` (Admin → Asset Layouts folder groupings) is not remapped; layouts may appear ungrouped until reorganized in admin. |
-| **ListSelect** | Source list ids are mapped to target lists by **list name** (`Get-MigrationListMap`). Unmatched lists leave `list_id` unset. |
+| **Admin folders** | Admin → Asset Layouts folder groupings are migrated from `sidebar_folder_id` (folders created on target, then assigned via PUT). Parent folders are included. KB/article folders (`Migrate-Folders.ps1`) skip these. If folder create fails (unknown `folder_type` on your instance), layouts are still created but may appear ungrouped in admin until fixed manually. |
+| **ListSelect** | Source list ids are mapped to target lists by **list name** (`Get-MigrationListMap`). Asset field values are remapped to the **target list’s allowed options** (exact match, aliases like `SMB` → `SMB / CIFS`, or `Other`). In test mode, a list matched by name may have different options than on the source — values that cannot map are dropped with a warning. |
 | **AssetTag layouts** | `linkable_id` pointing at another layout is remapped in a **second pass** via `Set-HuduAssetLayout` after all layouts exist. |
 | **Skipped layouts** | If layout create fails, assets using that layout are skipped. |
 | **Assets** | Per-company via `New-HuduAsset` with `custom_fields` from layout field **labels** (snake_case). Archived source assets are skipped. |
