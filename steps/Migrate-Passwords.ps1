@@ -7,10 +7,17 @@ function Invoke-PasswordMigration {
         [hashtable]$CompanyMap,
         [System.Collections.IDictionary]$Stats,
         [string]$MigrationMode,
-        [int]$SelectedCompanyId
+        [int]$SelectedCompanyId,
+        [ValidateSet('All', 'Global', 'Company')]
+        [string]$MigrationScope = 'All'
     )
 
-    Write-Log "========== STEP 3: MIGRATING PASSWORDS AND PASSWORD FOLDERS =========="
+    $scopeLabel = switch ($MigrationScope) {
+        'Global'  { 'tenant-wide password folders only' }
+        'Company' { 'company password folders only' }
+        default   { 'all password folders' }
+    }
+    Write-Log "========== STEP 3: MIGRATING PASSWORDS AND PASSWORD FOLDERS ($scopeLabel) =========="
 
     if (-not $Stats) {
         $Stats = [PSCustomObject]@{
@@ -91,6 +98,8 @@ function Invoke-PasswordMigration {
                 continue
             }
         }
+        if ($MigrationScope -eq 'Global' -and -not (Test-HuduRecordIsGlobal -Record $folder)) { continue }
+        if ($MigrationScope -eq 'Company' -and (Test-HuduRecordIsGlobal -Record $folder)) { continue }
 
         $folderKey = Get-PasswordFolderLookupKey -Name $folder.name -CompanyId 0
         $existing = $PasswordFolderLookup[$folderKey]
@@ -145,6 +154,8 @@ function Invoke-PasswordMigration {
                 continue
             }
         }
+        if ($MigrationScope -eq 'Global' -and -not (Test-HuduRecordIsGlobal -Record $password)) { continue }
+        if ($MigrationScope -eq 'Company' -and (Test-HuduRecordIsGlobal -Record $password)) { continue }
 
         $targetCompanyId = $null
         if ($password.company_id -and $password.company_id -ne 0) {

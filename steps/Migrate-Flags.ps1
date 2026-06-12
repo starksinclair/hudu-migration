@@ -295,14 +295,26 @@ function Invoke-FlagMigration {
         [hashtable]$AssetMap = @{},
         [System.Collections.IDictionary]$Stats,
         [string]$MigrationMode,
-        [int]$SelectedCompanyId
+        [int]$SelectedCompanyId,
+        [ValidateSet('All', 'Global', 'Company')]
+        [string]$MigrationScope = 'All'
     )
 
-    Write-Log "========== STEP: MIGRATING FLAGS =========="
+    $scopeLabel = switch ($MigrationScope) {
+        'Global'  { 'flag types + flags on migrated global KB articles' }
+        'Company' { 'flag instances on company objects (types matched/created as needed)' }
+        default   { 'flag types and all flag instances' }
+    }
+    Write-Log "========== STEP: MIGRATING FLAGS ($scopeLabel) =========="
 
     $flagTypeMap = Initialize-FlagTypeMap -Stats $Stats
     if ($flagTypeMap.Count -eq 0) {
         Write-Log "No flag types mapped — skipping flags." "WARN"
+        return
+    }
+
+    if ($MigrationScope -eq 'Global' -and $ArticleMap.Count -eq 0) {
+        Write-Log "Global scope: flag types ensured; no articles in ArticleMap — skipping flag instances." "INFO"
         return
     }
 
@@ -327,6 +339,15 @@ function Invoke-FlagMigration {
 
     foreach ($flag in $flags) {
         if (-not $flag.id -or -not $flag.flag_type_id) { continue }
+
+        if ($MigrationScope -eq 'Global') {
+            if ([string]$flag.flagable_type -notmatch '^Article$') { continue }
+            if (-not $ArticleMap.ContainsKey([string]$flag.flagable_id)) { continue }
+        } elseif ($MigrationScope -eq 'Company' -and
+            [string]$flag.flagable_type -match '^Article$' -and
+            -not $ArticleMap.ContainsKey([string]$flag.flagable_id)) {
+            continue
+        }
 
         $targetFlagTypeId = $flagTypeMap[[string]$flag.flag_type_id]
         if (-not $targetFlagTypeId) {

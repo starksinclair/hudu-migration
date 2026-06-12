@@ -1,0 +1,15 @@
+{
+  "name": "hudu-migration",
+  "version": "1.0.0",
+  "description": "Hudu-to-Hudu migration tool (Node.js/TypeScript port)",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "tsc && node --env-file .env dist/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

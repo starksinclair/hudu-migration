@@ -35,6 +35,28 @@ function Get-MigrationName {
     return "$Name$suffix"
 }
 
+# company_id null/0 = Global KB, tenant-wide folders, etc.
+function Test-HuduRecordIsGlobal {
+    param(
+        [object]$Record,
+        [string]$PropertyName = 'company_id'
+    )
+    if (-not $Record) { return $true }
+    if (-not $Record.PSObject.Properties[$PropertyName]) { return $true }
+    $cid = $Record.$PropertyName
+    return (-not $cid -or [int]$cid -eq 0)
+}
+
+function Test-MigrationScopeIncludesGlobal {
+    param([string]$MigrationScope)
+    return $MigrationScope -in @('All', 'Global')
+}
+
+function Test-MigrationScopeIncludesCompany {
+    param([string]$MigrationScope)
+    return $MigrationScope -in @('All', 'Company')
+}
+
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -898,9 +920,143 @@ function ConvertTo-HuduAssetCustomFieldsPayload {
     return @($payload.ToArray())
 }
 
+function Get-MigrationListItemNames {
+    param([object]$List)
+
+    $names = [System.Collections.Generic.List[string]]::new()
+    if (-not $List) { return @() }
+
+    foreach ($prop in @('items', 'list_items', 'list_item')) {
+        if (-not $List.PSObject.Properties[$prop] -or -not $List.$prop) { continue }
+        foreach ($item in @($List.$prop)) {
+            $name = $null
+            if ($item -is [string]) {
+                $name = $item
+            } elseif ($item.PSObject.Properties['name'] -and $item.name) {
+                $name = [string]$item.name
+            } elseif ($item.PSObject.Properties['label'] -and $item.label) {
+                $name = [string]$item.label
+            }
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $trimmed = $name.Trim()
+            if (-not ($names -contains $trimmed)) { $null = $names.Add($trimmed) }
+        }
+    }
+
+    return @($names.ToArray())
+}
+
+function Get-MigrationSourceListDetail {
+    param([int]$ListId)
+
+    if ($ListId -le 0) { return $null }
+
+    Use-SourceHudu
+    try {
+        $raw = Get-HuduLists -Id $ListId
+        if (-not $raw) { return $null }
+        if ($raw.PSObject.Properties['list'] -and $raw.list) { return $raw.list }
+        return $raw
+    } catch {
+        Write-Log "Could not load source list ID $ListId : $(Get-HuduApiErrorSummary $_)" "WARN"
+        return $null
+    }
+}
+
+function Get-MigrationListIdsFromAssetLayouts {
+    param([object[]]$SourceLayouts)
+
+    $ids = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($layout in @($SourceLayouts)) {
+        if (-not $layout -or -not $layout.fields) { continue }
+        foreach ($field in @($layout.fields)) {
+            if ([string]$field.field_type -ne 'ListSelect') { continue }
+            if ($field.list_id -and [int]$field.list_id -gt 0) {
+                [void]$ids.Add([int]$field.list_id)
+            }
+        }
+    }
+    return @($ids)
+}
+
+function New-MigrationTargetList {
+    param(
+        [string]$Name,
+        [string[]]$Items
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        throw 'List name is required.'
+    }
+    if (-not $Items -or $Items.Count -eq 0) {
+        throw "List '$Name' has no items on source — Hudu requires at least one list option."
+    }
+
+    Use-TargetHudu
+    $listItems = @($Items | ForEach-Object { @{ name = $_ } })
+    try {
+        $response = Invoke-HuduJsonApi -Method POST -Resource '/api/v1/lists' -Body @{
+            list = @{
+                name                  = $Name
+                list_items_attributes = $listItems
+            }
+        }
+        $created = $response.list ?? $response
+        if ($created -and $created.id) { return $created }
+    } catch {
+        Write-Log "JSON create failed for list '$Name': $(Get-HuduApiErrorSummary $_)" "WARN"
+    }
+
+    $fallback = New-HuduList -Name $Name -Items $Items
+    if (-not $fallback) { return $null }
+    return $fallback.list ?? $fallback
+}
+
 function Get-MigrationListMap {
+    param([object[]]$SourceLayouts = @())
+
+    Write-Log "Migrating Hudu lists (required for ListSelect asset layout fields)..."
+
     Use-SourceHudu
     $sourceLists = @(Get-HuduObjectList -Response (Get-HuduLists) -CollectionNames @('lists'))
+    $sourceById = @{}
+    foreach ($sl in $sourceLists) {
+        if ($sl.id) { $sourceById[[string]$sl.id] = $sl }
+    }
+
+    $requiredListIds = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($id in (Get-MigrationListIdsFromAssetLayouts -SourceLayouts $SourceLayouts)) {
+        [void]$requiredListIds.Add($id)
+    }
+
+    foreach ($layout in @($SourceLayouts)) {
+        if (-not $layout.id) { continue }
+        try {
+            $detail = Get-AssetLayoutDetail -LayoutId ([int]$layout.id)
+            foreach ($id in (Get-MigrationListIdsFromAssetLayouts -SourceLayouts @($detail))) {
+                [void]$requiredListIds.Add($id)
+            }
+        } catch {
+            Write-Log "Could not load layout detail for list discovery on '$($layout.name)': $_" "WARN"
+        }
+    }
+
+    $listsToProcess = [System.Collections.Generic.List[object]]::new()
+    foreach ($sl in $sourceLists) {
+        if ($sl.id) { $null = $listsToProcess.Add($sl) }
+    }
+    foreach ($listId in @($requiredListIds)) {
+        $key = [string]$listId
+        if (-not $sourceById.ContainsKey($key)) {
+            Write-Log "ListSelect references source list ID $listId but it was not in GET /lists — fetching by ID." "WARN"
+            $detail = Get-MigrationSourceListDetail -ListId $listId
+            if ($detail) {
+                $sourceById[$key] = $detail
+                $null = $listsToProcess.Add($detail)
+            }
+        }
+    }
+
     Use-TargetHudu
     $targetLists = @(Get-HuduObjectList -Response (Get-HuduLists) -CollectionNames @('lists'))
     $targetByName = @{}
@@ -909,26 +1065,72 @@ function Get-MigrationListMap {
     }
 
     $map = @{}
-    foreach ($sl in $sourceLists) {
+    $created = 0
+    $matched = 0
+    $failed  = 0
+    $seenSourceIds = @{}
+
+    foreach ($sl in $listsToProcess) {
         if (-not $sl.id) { continue }
-        $norm = if ($sl.name) { [string]$sl.name.Trim().ToLowerInvariant() } else { '' }
+        $sourceIdKey = [string]$sl.id
+        if ($seenSourceIds.ContainsKey($sourceIdKey)) { continue }
+        $seenSourceIds[$sourceIdKey] = $true
+
+        $listName = if ($sl.name) { [string]$sl.name } else { "List $sourceIdKey" }
+        $norm = $listName.Trim().ToLowerInvariant()
+
+        $detail = Get-MigrationSourceListDetail -ListId ([int]$sl.id)
+        if (-not $detail) { $detail = $sl }
+
+        $itemNames = @(Get-MigrationListItemNames -List $detail)
+        if ($itemNames.Count -eq 0) {
+            $itemNames = @(Get-MigrationListItemNames -List $sl)
+        }
+
         if ($norm -and $targetByName.ContainsKey($norm)) {
-            $map[[string]$sl.id] = [int]$targetByName[$norm].id
+            $targetList = $targetByName[$norm]
+            $map[$sourceIdKey] = [int]$targetList.id
+            $matched++
+            $targetItemCount = @(Get-MigrationListItemNames -List $targetList).Count
+            Write-Log "List '$listName' already on target (ID $($targetList.id), $targetItemCount option(s))." "INFO"
+            if ($itemNames.Count -gt 0 -and $targetItemCount -eq 0) {
+                Write-Log "  Target list '$listName' has no options but source has $($itemNames.Count) — layout ListSelect may not match source values." "WARN"
+            }
             continue
         }
+
+        if ($itemNames.Count -eq 0) {
+            $failed++
+            Write-Log "Cannot create list '$listName' (source ID $sourceIdKey): no list options on source (index and GET /lists/{id} were empty)." "WARN"
+            continue
+        }
+
         try {
-            $items = @()
-            if ($sl.PSObject.Properties['items'] -and $sl.items) { $items = @($sl.items) }
-            $created = New-HuduList -Name $sl.name -Items $items
-            $newList = $created.list ?? $created
-            if ($newList.id) {
-                $map[[string]$sl.id] = [int]$newList.id
-                $targetByName[$norm] = $newList
+            $targetName = Get-MigrationName -Name $listName
+            $newList = New-MigrationTargetList -Name $targetName -Items $itemNames
+            if ($newList -and $newList.id) {
+                $map[$sourceIdKey] = [int]$newList.id
+                $targetByName[$targetName.Trim().ToLowerInvariant()] = $newList
+                $created++
+                Write-Log "Created list '$targetName' => target ID $($newList.id) ($($itemNames.Count) option(s))" "SUCCESS"
+            } else {
+                $failed++
+                Write-Log "Failed to create list '$targetName' — API returned no list id." "ERROR"
             }
         } catch {
-            Write-Log "Could not create target list '$($sl.name)': $_" "WARN"
+            $failed++
+            Write-Log "Could not create target list '$listName': $_" "ERROR"
         }
     }
+
+    Write-Log "Lists - Created: $created | Matched: $matched | Failed: $failed | Mapped for layouts: $($map.Count)"
+    if ($requiredListIds.Count -gt 0) {
+        $missingForLayouts = @($requiredListIds | Where-Object { -not $map.ContainsKey([string]$_) })
+        if ($missingForLayouts.Count -gt 0) {
+            Write-Log "ListSelect fields reference $($missingForLayouts.Count) source list(s) that could not be mapped: $($missingForLayouts -join ', ')" "WARN"
+        }
+    }
+
     return $map
 }
 
@@ -1032,7 +1234,15 @@ function ConvertTo-MigrationAssetLayoutField {
     }
     if ($Field.PSObject.Properties['options'] -and $Field.options) { $def['options'] = [string]$Field.options }
 
-    if ($Field.field_type -eq 'ListSelect' -and $Field.list_id -and $ListMap.ContainsKey([string]$Field.list_id)) {
+    if ($Field.field_type -eq 'ListSelect') {
+        if (-not $Field.list_id) {
+            Write-Log "ListSelect '$($Field.label)': source field has no list_id — skipping field." "WARN"
+            return $null
+        }
+        if (-not $ListMap.ContainsKey([string]$Field.list_id)) {
+            Write-Log "ListSelect '$($Field.label)': no target list for source list ID $($Field.list_id) — skipping field." "WARN"
+            return $null
+        }
         $def['list_id'] = [int]$ListMap[[string]$Field.list_id]
     }
     if ($Field.field_type -eq 'AssetTag' -and $Field.linkable_id -and $LayoutMap.ContainsKey([string]$Field.linkable_id)) {

@@ -11,24 +11,42 @@ function Invoke-ArticleMigration {
         [string]     $MigrationMode,
         [int]        $SelectedCompanyId,
         [string]     $TempPath,
-        [int]        $MaxFileSizeMB
+        [int]        $MaxFileSizeMB,
+        [ValidateSet('All', 'Global', 'Company')]
+        [string]     $MigrationScope = 'All'
     )
 
-    Write-Log "========== STEP 2b: MIGRATING ARTICLES =========="
+    $scopeLabel = switch ($MigrationScope) {
+        'Global'  { 'global / central KB articles only' }
+        'Company' { 'company KB articles only' }
+        default   { 'all articles' }
+    }
+    Write-Log "========== STEP 2b: MIGRATING ARTICLES ($scopeLabel) =========="
 
     $articleMap = @{}
 
     Use-SourceHudu
     Write-Log "Fetching source articles..."
     try {
-        if ($MigrationMode -eq "SINGLE") {
-            $companyArticles   = @(Get-HuduArticles -company_id $SelectedCompanyId)
-            $allSourceArticles = @(Get-HuduArticles)
-            $globalArticles    = @($allSourceArticles | Where-Object { -not $_.company_id -or $_.company_id -eq 0 })
-            $articles          = $companyArticles + $globalArticles
+        $allSourceArticles = @(Get-HuduArticles)
+        if ($MigrationScope -eq 'Global') {
+            $articles = @($allSourceArticles | Where-Object { Test-HuduRecordIsGlobal -Record $_ })
+            Write-Log "GLOBAL SCOPE: $($articles.Count) central KB article(s)"
+        } elseif ($MigrationScope -eq 'Company') {
+            if ($MigrationMode -eq 'SINGLE') {
+                $articles = @(Get-HuduArticles -company_id $SelectedCompanyId)
+                Write-Log "COMPANY SCOPE (single): $($articles.Count) article(s) for company ID $SelectedCompanyId"
+            } else {
+                $articles = @($allSourceArticles | Where-Object { -not (Test-HuduRecordIsGlobal -Record $_) })
+                Write-Log "COMPANY SCOPE (all companies): $($articles.Count) company KB article(s)"
+            }
+        } elseif ($MigrationMode -eq 'SINGLE') {
+            $companyArticles = @(Get-HuduArticles -company_id $SelectedCompanyId)
+            $globalArticles  = @($allSourceArticles | Where-Object { Test-HuduRecordIsGlobal -Record $_ })
+            $articles        = $companyArticles + $globalArticles
             Write-Log "SINGLE MODE: $($companyArticles.Count) company + $($globalArticles.Count) global KB articles"
         } else {
-            $articles = @(Get-HuduArticles)
+            $articles = $allSourceArticles
             Write-Log "ALL MODE: $($articles.Count) total articles"
         }
     } catch {

@@ -7,10 +7,17 @@ function Invoke-FolderMigration {
         [hashtable]$CompanyMap,
         [System.Collections.IDictionary]$Stats,
         [string]   $MigrationMode,
-        [int]      $SelectedCompanyId
+        [int]      $SelectedCompanyId,
+        [ValidateSet('All', 'Global', 'Company')]
+        [string]   $MigrationScope = 'All'
     )
 
-    Write-Log "========== STEP 2a: MIGRATING FOLDERS =========="
+    $scopeLabel = switch ($MigrationScope) {
+        'Global'  { 'global KB folders only' }
+        'Company' { 'company KB folders only' }
+        default   { 'all KB folders' }
+    }
+    Write-Log "========== STEP 2a: MIGRATING FOLDERS ($scopeLabel) =========="
 
     $folderMap = @{}
 
@@ -38,6 +45,13 @@ function Invoke-FolderMigration {
             if ($MigrationMode -eq "SINGLE" -and
                 $folder.company_id -and $folder.company_id -ne 0 -and
                 $folder.company_id -ne $SelectedCompanyId) {
+                $pending.RemoveAt($i); continue
+            }
+
+            if ($MigrationScope -eq 'Global' -and -not (Test-HuduRecordIsGlobal -Record $folder)) {
+                $pending.RemoveAt($i); continue
+            }
+            if ($MigrationScope -eq 'Company' -and (Test-HuduRecordIsGlobal -Record $folder)) {
                 $pending.RemoveAt($i); continue
             }
 

@@ -153,8 +153,8 @@ function Invoke-AssetLayoutMigration {
 
     $sidebarFolderMap = Invoke-AssetLayoutSidebarFolderMigration -SourceLayouts $sourceLayouts
 
-    Write-Log "Building list map for ListSelect fields..."
-    $listMap = Get-MigrationListMap
+    Write-Log "Building list map for ListSelect fields (fetching full list details from source)..."
+    $listMap = Get-MigrationListMap -SourceLayouts $sourceLayouts
 
     Use-TargetHudu
     $targetLayouts = @(Get-HuduObjectList -Response (Get-HuduAssetLayouts) -CollectionNames @('asset_layouts'))
@@ -183,13 +183,21 @@ function Invoke-AssetLayoutMigration {
         }
 
         try {
+            Use-SourceHudu
+            $layoutDetail = Get-AssetLayoutDetail -LayoutId ([int]$layout.id)
+            $sourceFields = if ($layoutDetail -and $layoutDetail.fields) {
+                @($layoutDetail.fields)
+            } elseif ($layout.fields) {
+                @($layout.fields)
+            } else {
+                @()
+            }
+
             Use-TargetHudu
             $fieldDefs = @()
-            if ($layout.fields) {
-                foreach ($field in @($layout.fields | Sort-Object { $_.position })) {
-                    $def = ConvertTo-MigrationAssetLayoutField -Field $field -ListMap $listMap -LayoutMap $layoutMap
-                    if ($def) { $fieldDefs += $def }
-                }
+            foreach ($field in @($sourceFields | Sort-Object { $_.position })) {
+                $def = ConvertTo-MigrationAssetLayoutField -Field $field -ListMap $listMap -LayoutMap $layoutMap
+                if ($def) { $fieldDefs += $def }
             }
 
             $params = @{
@@ -206,6 +214,9 @@ function Invoke-AssetLayoutMigration {
 
             $created = New-HuduAssetLayout @params
             $newLayout = $created.asset_layout ?? $created
+            if (-not $newLayout -or -not $newLayout.id -or [int]$newLayout.id -le 0) {
+                throw "API returned no valid asset layout id (got '$($newLayout.id)')."
+            }
             $newId = [int]$newLayout.id
             $layoutMap[[string]$layout.id] = $newId
             $Stats.AssetLayoutsCreated++
@@ -241,11 +252,19 @@ function Invoke-AssetLayoutMigration {
         if (-not $needsLinkableFix) { continue }
 
         try {
+            Use-SourceHudu
+            $layoutDetail = Get-AssetLayoutDetail -LayoutId ([int]$layout.id)
+            $sourceFields = if ($layoutDetail -and $layoutDetail.fields) {
+                @($layoutDetail.fields)
+            } else {
+                @($layout.fields)
+            }
+
             Use-TargetHudu
             $targetId = [int]$layoutMap[$sourceLayoutId]
             $detail = Get-AssetLayoutDetail -LayoutId $targetId
             $updatedFields = @()
-            foreach ($field in @($layout.fields | Sort-Object { $_.position })) {
+            foreach ($field in @($sourceFields | Sort-Object { $_.position })) {
                 $def = ConvertTo-MigrationAssetLayoutField -Field $field -ListMap $listMap -LayoutMap $layoutMap
                 if ($def) { $updatedFields += $def }
             }

@@ -9,7 +9,7 @@ The main entry point is `company-migration.ps1`, which orchestrates companies, a
 | Step | Phase             | What happens                                                               |
 | ---- | ----------------- | -------------------------------------------------------------------------- |
 | 1    | **Companies**     | Name, type, address, phone/fax, website, ID, notes, parent link → `CompanyMap` |
-| 2    | **Asset layouts** | Layouts + field definitions (ListSelect lists mapped) → `LayoutMap`        |
+| 2    | **Lists + asset layouts** | Lists fetched by ID first, then layouts + ListSelect fields → `LayoutMap` |
 | 3a   | **KB folders**    | Article folders only (photo folders handled later) → `FolderMap`           |
 | 3b   | **Articles**      | Content, sharing, attachments (`public_photos` + `uploads`) → `ArticleMap` |
 | 4    | **Passwords**     | Password folders + credentials (description, `login_url`; not vault `url`) |
@@ -77,13 +77,26 @@ $LogDir   = "C:\Temp\HuduMigration\logs"
 
 # KB-only (no asset layouts, assets, or relations):
 . .\company-migration.ps1 -SkipAssetMigration
+
+# Two-phase production migration (recommended for source → target):
+. .\company-migration.ps1 -MigrationScope Global    # once: layouts, central KB, flag types
+. .\company-migration.ps1 -MigrationScope Company   # per company: everything else
 ```
 
-Dot-source (`. .\company-migration.ps1`) is required so `$CompanyMap`, `$ArticleMap`, stats, and selector state persist in your session. At startup you are asked whether to skip asset layouts, assets, and relations (default **no**). Pass `-SkipAssetMigration` on the dot-source line to skip the prompt and skip those steps.
+Dot-source (`. .\company-migration.ps1`) is required so `$CompanyMap`, `$ArticleMap`, stats, and selector state persist in your session.
+
+At startup you are asked for **migration scope** (`All` | `Global` | `Company`) unless `-MigrationScope` is passed. You are also asked whether to skip asset layouts (and assets/relations when applicable) unless `-SkipAssetMigration` is passed.
+
+| Scope | What runs |
+| ----- | --------- |
+| **All** (default) | Full migration — same as before |
+| **Global** | Asset layouts (+ lists), central KB folders/articles, relink, flag types, tenant-wide passwords; **no** company selector |
+| **Company** | Companies, company KB, passwords, procedures, websites, IPAM, photos, assets, racks, relations, flags; **no** layouts or central KB |
 
 ## Features
 
-- **SkipAssetMigration** — optional switch to skip asset layouts, assets, and relations (other steps unchanged)
+- **MigrationScope** — `All`, `Global`, or `Company` to split tenant-wide vs per-company work across runs
+- **SkipAssetMigration** — skip asset layouts (Global/All) and assets/relations (Company/All)
 - **Single-instance test mode** — run against one tenant with suffixed names (`1` at startup)
 - **Single-company test mode** — migrate one company before a full production run
 - **Idempotent creates** — match existing target records by name (+ company) where possible before creating
